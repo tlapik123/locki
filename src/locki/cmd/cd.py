@@ -30,6 +30,8 @@ def cd_cmd(match, interactive, create, dirty, raw):
 
     worktrees.ensure_created(worktree, dirty=dirty, raw=raw)
 
+    # cd never touches the VM, so stamp here or host-side work reads as stale
+    worktrees.touch(worktree.wt_id)
     shell = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
     os.chdir(worktree.path)
     os.execvp(shell, [shell])

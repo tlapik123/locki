@@ -38,6 +38,8 @@ def ide_cmd(match, interactive, create, dirty, raw):
 
     worktrees.ensure_created(worktree, dirty=dirty, raw=raw)
 
+    # ide never touches the VM, so stamp here or IDE-driven work reads as stale
+    worktrees.touch(worktree.wt_id)
     argv = shlex.split(ide_command)
     try:
         subprocess.run(argv, cwd=str(worktree.path))
