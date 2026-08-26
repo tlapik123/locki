@@ -6,13 +6,23 @@ Incus container in a shared Lima VM, isolated from the host repo and home.
 ## Language
 
 **Sandbox**:
-A worktree plus its Incus container; the unit users create, enter, and remove.
+A worktree plus its Incus container; the unit users create, enter, stop, and remove.
 _Avoid_: container, VM, environment
 
 **Worktree**:
 The host-side git worktree of a sandbox, bind-mounted into its container at the
-same absolute path.
+same absolute path. Can outlive its container (e.g. after `locki vm delete`).
 _Avoid_: checkout, workspace
+
+**Container**:
+The Incus half of a sandbox, named by the sandbox id. Disposable — recreated on
+demand from the worktree.
+
+**Sandbox id**:
+The 8-character slug shared by the worktree directory (`<repo>-locki-<id>`), the
+branch suffix (`#locki-<id>`), and the container name.
+_Avoid_: treating "worktree id" and "container name" as distinct identifiers —
+they are all the same id
 
 **Host repo**:
 The user's original clone that worktrees are created from (`WorktreeInfo.repo`).
@@ -49,3 +59,26 @@ untracked with different content, tracked with uncommitted modifications, an
 uncommitted deletion, or a directory/symlink standing in the file's place.
 A file differing only in the executable bit differs (git tracks that bit).
 _Avoid_: conflict (that's git merges), collision
+
+**Idle**:
+A container with no live Incus operation. Idle containers are *stopped*, never
+deleted.
+
+**Last used**:
+When a sandbox was last opened (`ai`/`x`/`cd`/`ide`) or had container activity.
+Not the worktree's file mtimes.
+_Avoid_: last active (that is the daemon's transient bookkeeping for running
+containers)
+
+**Orphan**:
+A container whose worktree no longer exists on disk; reaped automatically.
+
+**Stop**:
+Reversible shutdown of a sandbox's container; worktree, branches, and container
+survive.
+_Avoid_: pause (a different Incus operation — freeze)
+
+**Remove**:
+Deletion of a sandbox: container and worktree are gone; branches survive unless
+asked.
+_Avoid_: delete (reserved for `locki vm delete`, which destroys the whole VM)
