@@ -122,6 +122,22 @@ assert_ok "daemon.log survives log pruning" test -f "$LOGS_DIR/daemon.log"
 kept=$(find "$LOGS_DIR" -name '2[0-9]*.log' | wc -l | tr -d ' ')
 if [[ "$kept" -eq 20 ]]; then pass "per-run logs pruned to 20 ($kept)"; else fail "per-run logs pruned to 20 (got $kept)"; fi
 
+# ── fresh repo without commits ───────────────────────────────────────────────
+# VM-independent: sandbox creation branches off HEAD, which doesn't exist in a
+# fresh `git init` repo — must be rejected with a clear error, not a traceback.
+
+echo
+echo "Testing fresh repo without commits..."
+
+EMPTY_REPO="$TMPDIR_ROOT/empty-repo"
+git init -q "$EMPTY_REPO"
+if empty_out=$( (cd "$EMPTY_REPO" && locki new 2>&1) ); then
+    fail "locki new in a no-commit repo fails"
+else
+    pass "locki new in a no-commit repo fails"
+fi
+if grep -q "no commits yet" <<<"$empty_out"; then pass "no-commit repo error is friendly"; else fail "no-commit repo error is friendly (got: $empty_out)"; fi
+
 # ── cold start + parallel VM creation ────────────────────────────────────────
 
 echo
