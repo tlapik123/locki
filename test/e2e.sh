@@ -1127,6 +1127,21 @@ else
     fail "node auto-install recursed ($nrec_calls mise calls; reentrancy guard broken)"
 fi
 
+# ── node self-repair of a broken half-install ────────────────────────────────
+# Regression: an interrupted download left an empty mise version dir that mise counted
+# as installed — `mise install` no-oped while `mise which` kept failing — so the node
+# shim exec'd an empty string forever ("exec: : not found"). locki-ensure-node must
+# detect the split-brain state, purge it, and reinstall.
+echo
+echo "Testing node self-repair of a broken half-install..."
+
+# Drop the fake mise from the recursion test, then fabricate the wreck: an empty
+# version dir for whatever `node = "latest"` resolves to. If version resolution
+# fails (API rate limit), no dir is made and this degrades to a plain install check.
+locki x -m "$NREC" sh -c 'rm -f /root/.local/bin/mise
+v=$(MISE_LOCKFILE=false mise latest node 2>/dev/null) && mkdir -p "${MISE_DATA_DIR:-/usr/share/mise}/installs/node/$v" || true'
+assert_ok "node shim repairs the half-install and runs" locki x -m "$NREC" node --version
+
 # ── no incus failures anywhere ───────────────────────────────────────────────
 
 assert_fail "no 'Failed instance creation' in any remaining log" grep -rq "Failed instance creation" "$LOGS_DIR"

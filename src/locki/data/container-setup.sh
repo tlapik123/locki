@@ -142,6 +142,14 @@ locki-command-real node >/dev/null 2>&1 && exit 0
 # npm shim while node is still missing -> unbounded recursion. Only the outermost call installs.
 [ -z "${LOCKI_ENSURING_NODE:-}" ] || exit 0
 export LOCKI_ENSURING_NODE=1
+/opt/locki/bin/high/locki-auto-install nodejs /opt/locki/bin/high/locki-mise-install node >/dev/null 2>&1 || exit 1
+locki-command-real node >/dev/null 2>&1 && exit 0
+# An interrupted download can leave an empty version dir that mise counts as installed:
+# `mise install` then no-ops "successfully" while the node binary stays missing, so plain
+# reinstalling never heals it. Purge the wreck (uninstall also drops the possibly-truncated
+# tarball from the shared download cache) and install once more.
+_mise="${MISE_INSTALL_PATH:-/usr/local/bin/mise}"
+MISE_LOCKFILE=false MISE_NO_HOOKS=true "$_mise" uninstall node >/dev/null 2>&1
 /opt/locki/bin/high/locki-auto-install nodejs /opt/locki/bin/high/locki-mise-install node >/dev/null 2>&1
 EOF
 
