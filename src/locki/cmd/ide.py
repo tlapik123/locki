@@ -11,7 +11,7 @@ from locki.utils import fail, sandbox_options
 
 @click.command("ide")
 @sandbox_options(create=True)
-def ide_cmd(match, interactive, create):
+def ide_cmd(match, interactive, create, dirty, raw):
     """Open an IDE in a sandbox worktree.
 
     \b
@@ -36,8 +36,7 @@ def ide_cmd(match, interactive, create):
         create="force" if create else "allow",
     )
 
-    if not worktree.path.exists():
-        worktrees.create(worktree)
+    worktrees.ensure_created(worktree, dirty=dirty, raw=raw)
 
     argv = shlex.split(ide_command)
     try:
