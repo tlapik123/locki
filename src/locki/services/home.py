@@ -5,14 +5,32 @@ import json
 import os
 import pathlib
 import re
-import uuid
 from contextlib import suppress
 
 import click
 
 from locki.paths import PACKAGE_DATA, SANDBOX_HOME
 from locki.runes import WARNING
-from locki.utils import deep_merge
+from locki.utils import deep_merge, pretty_path
+
+
+def make_writable_file(path: pathlib.Path) -> None:
+    """Make *path* a plain, writable file (keeping its content) before it is written to.
+
+    Everything in the sandbox home is written with the sandbox in mind, so nothing in
+    there may be a link to a host path: a `~/.claude/settings.json` symlinked into the
+    user's dotfiles would receive `bypassPermissions` and thus disable permission prompts
+    for their *unsandboxed* agents. `locki setup --copy` no longer copies symlinks or
+    read-only modes in, but older versions did, so both are undone here too.
+    """
+    with suppress(OSError):
+        if path.is_symlink():
+            click.echo(f"{WARNING} {pretty_path(path)} is a symlink; replacing it with a plain copy.")
+            content = path.read_bytes() if path.exists() else b""
+            path.unlink()
+            path.write_bytes(content)
+        elif path.exists():
+            path.chmod(path.stat().st_mode | 0o600)
 
 
 class HomeService:
@@ -63,26 +81,30 @@ class HomeService:
             ),
         ]:
             path.parent.mkdir(parents=True, exist_ok=True)
+            make_writable_file(path)
             try:
                 existing = json.loads(path.read_text()) if path.exists() else {}
                 path.write_text(json.dumps(deep_merge(existing, updates), indent=2))
             except json.JSONDecodeError:
                 click.echo(f"{WARNING} Invalid JSON data found in {path}, not updating it.")
+            except OSError as e:
+                click.echo(f"{WARNING} Could not update {pretty_path(path)}: {e}. The agent may misbehave.")
 
         # agy's only non-workspace context file; overwrites a global GEMINI.md copied in
         # from the host (agy has no way to load an extra instructions path).
-        (SANDBOX_HOME / ".gemini" / "GEMINI.md").write_bytes((PACKAGE_DATA / "AGENTS.md").read_bytes())
+        gemini_md = SANDBOX_HOME / ".gemini" / "GEMINI.md"
+        make_writable_file(gemini_md)
+        gemini_md.write_bytes((PACKAGE_DATA / "AGENTS.md").read_bytes())
 
         guard = SANDBOX_HOME / ".claude" / "hooks" / "locki-branch-guard.sh"
         guard.parent.mkdir(parents=True, exist_ok=True)
+        make_writable_file(guard)
         guard.write_bytes((PACKAGE_DATA / "claude-branch-guard.sh").read_bytes())
 
-    def ensure_resume_transcript(self, wt_path: pathlib.Path) -> None:
-        """`claude -c` needs an existing transcript; plant an empty one for fresh sandboxes."""
-        project_dir = self.claude_project_dir(wt_path)
-        project_dir.mkdir(parents=True, exist_ok=True)
-        if not any(project_dir.glob("*.jsonl")):
-            (project_dir / f"{uuid.uuid4()}.jsonl").write_text("\n")
+    def has_claude_transcript(self, wt_path: pathlib.Path) -> bool:
+        """Whether interactive `claude -c` has anything to continue: since 2.1.263 it refuses to start
+        otherwise, and only counts interactive sessions (entrypoint "cli"; `-p` runs are "sdk-cli")."""
+        return any(b'"entrypoint":"cli"' in p.read_bytes() for p in self.claude_project_dir(wt_path).glob("*.jsonl"))
 
     def ai_title(self, wt_path: pathlib.Path) -> str:
         """Last AI-generated session title from the sandbox's Claude Code transcripts, or "".

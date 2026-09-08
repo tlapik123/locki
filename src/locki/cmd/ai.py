@@ -35,9 +35,9 @@ def ai_cmd(ctx, match, interactive, create, dirty, raw):
         create="force" if create else "allow",
     )
 
-    ai_command = ensure_configured(worktree.repo).ai_command
+    ai_command = shlex.split(ensure_configured(worktree.repo).ai_command)
 
-    if shlex.split(ai_command)[0] == "claude":
-        home.ensure_resume_transcript(worktree.path)
+    if ai_command[0] == "claude" and not home.has_claude_transcript(worktree.path):
+        ai_command = [a for a in ai_command if a not in ("-c", "--continue")]
 
-    enter_sandbox(worktree, [*shlex.split(ai_command), *ctx.args], dirty=dirty, raw=raw)
+    enter_sandbox(worktree, [*ai_command, *ctx.args], dirty=dirty, raw=raw)

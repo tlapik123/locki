@@ -369,6 +369,11 @@ assert_ok "python resolves" locki x -m "$RELEASE" python --version
 assert_ok "pip3 resolves" locki x -m "$RELEASE" pip3 --version
 assert_ok "pip resolves" locki x -m "$RELEASE" pip --version
 
+# ── mise + node preinstalled ─────────────────────────────────────────────────
+# Container setup installs mise and node eagerly (no mise/node/npx shims left to lazy-install them).
+
+assert_ok "mise + node preinstalled by container setup" locki x -m "$RELEASE" sh -c 'locki-command-real mise && locki-command-real node'
+
 # ── tool installs without the GitHub API ─────────────────────────────────────
 # /opt/locki/mise.lock pins each shim tool's version, URL and checksum, so installs
 # never call api.github.com — whose 60/hr anonymous limit every sandbox shares. When
@@ -862,6 +867,18 @@ cp "$AI_CONFIG" "$AI_CONFIG.bak"
 printf 'ai_command = "echo ai-ran"\nide_command = "true"\n' > "$AI_CONFIG"
 assert_output "locki ai runs configured command" "ai-ran" locki ai -m "$LOGIN"
 assert_output "locki ai forwards extra args" "ai-ran --resume extra-arg" locki ai -m "$LOGIN" --resume extra-arg
+
+FAKE_CLAUDE="$XDG_DATA_HOME/locki/home/.local/bin/claude"
+mkdir -p "$(dirname "$FAKE_CLAUDE")"
+printf '#!/bin/bash\necho "claude $* END"\n' > "$FAKE_CLAUDE"
+chmod +x "$FAKE_CLAUDE"
+printf 'ai_command = "claude --yolo -c"\nide_command = "true"\n' > "$AI_CONFIG"
+assert_output "locki ai drops -c without a claude transcript" "claude --yolo END" locki ai -m "$LOGIN"
+CLAUDE_PROJ="$XDG_DATA_HOME/locki/home/.claude/projects/$(worktree_of "$LOGIN" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$CLAUDE_PROJ"
+echo '{"type":"user","entrypoint":"cli","message":{"role":"user","content":"hi"}}' > "$CLAUDE_PROJ/00000000-0000-0000-0000-000000000000.jsonl"
+assert_output "locki ai keeps -c with a claude transcript" "claude --yolo -c END" locki ai -m "$LOGIN"
+rm -f "$FAKE_CLAUDE"
 mv "$AI_CONFIG.bak" "$AI_CONFIG"
 
 # ── locki list outside git repo ─────────────────────────────────────────────
@@ -1108,46 +1125,6 @@ if locki x -m "$LRENT" timeout 30 sh -c \
 else
     fail "nested auto-install deadlocked or errored (re-entrant lock broken)"
 fi
-
-# ── node auto-install must not recurse (fork-bomb regression) ────────────────
-# Regression: mise resolves npm-backed tools (`npm:foo`) by shelling out to `npm`, which
-# lands back on Locki's npm shim. With node still missing, that shim calls locki-ensure-node,
-# which runs `mise use -g node`, which shells out to `npm` again... Each level costs 4
-# processes; one sandbox on such a repo reached 32k processes and OOM-killed the whole VM.
-echo
-echo "Testing node auto-install does not recurse..."
-
-NREC=$(new_sandbox_id)
-# Fake mise ahead of the real one on PATH: locki-mise-install calls bare `mise` (shadowed),
-# while locki-command-real uses the absolute MISE_INSTALL_PATH (stays real, so the `node`
-# probe still fails honestly). Shelling out to npm is what real mise does for `npm:<pkg>`.
-locki x -m "$NREC" sh -c 'mkdir -p /root/.local/bin
-printf "#!/bin/sh\necho x >> /tmp/mise-calls\nnpm --version >/dev/null 2>&1\nexit 1\n" > /root/.local/bin/mise
-chmod +x /root/.local/bin/mise; : > /tmp/mise-calls'
-# ulimit caps the blast radius if the guard is gone; the call is expected to fail either
-# way (fake mise never installs node) — what matters is how often mise gets re-entered.
-locki x -m "$NREC" sh -c 'ulimit -u 400; timeout 60 npm --version' >/dev/null 2>&1 || true
-nrec_calls=$(locki x -m "$NREC" sh -c 'wc -l < /tmp/mise-calls' 2>/dev/null | tr -d ' \r\n')
-if [[ -n "$nrec_calls" && "$nrec_calls" -le 5 ]]; then
-    pass "node auto-install runs once, no recursion ($nrec_calls mise calls)"
-else
-    fail "node auto-install recursed ($nrec_calls mise calls; reentrancy guard broken)"
-fi
-
-# ── node self-repair of a broken half-install ────────────────────────────────
-# Regression: an interrupted download left an empty mise version dir that mise counted
-# as installed — `mise install` no-oped while `mise which` kept failing — so the node
-# shim exec'd an empty string forever ("exec: : not found"). locki-ensure-node must
-# detect the split-brain state, purge it, and reinstall.
-echo
-echo "Testing node self-repair of a broken half-install..."
-
-# Drop the fake mise from the recursion test, then fabricate the wreck: an empty
-# version dir for whatever `node = "latest"` resolves to. If version resolution
-# fails (API rate limit), no dir is made and this degrades to a plain install check.
-locki x -m "$NREC" sh -c 'rm -f /root/.local/bin/mise
-v=$(MISE_LOCKFILE=false mise latest node 2>/dev/null) && mkdir -p "${MISE_DATA_DIR:-/usr/share/mise}/installs/node/$v" || true'
-assert_ok "node shim repairs the half-install and runs" locki x -m "$NREC" node --version
 
 # ── no incus failures anywhere ───────────────────────────────────────────────
 
