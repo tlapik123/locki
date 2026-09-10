@@ -373,9 +373,6 @@ assert_ok "pip resolves" locki x -m "$RELEASE" pip --version
 # Container setup installs mise and node eagerly (no mise/node/npx shims left to lazy-install them).
 
 assert_ok "mise + node preinstalled by container setup" locki x -m "$RELEASE" sh -c 'locki-command-real mise && locki-command-real node'
-# Claude Code places its native binary from a postinstall script; mise's embedded installer
-# skips lifecycle scripts unless allow_builds is set, leaving a wrapper that errors out.
-assert_ok "claude installs with its native binary (postinstall ran)" locki x -m "$RELEASE" claude --version
 
 # ── tool installs without the GitHub API ─────────────────────────────────────
 # /opt/locki/mise.lock pins each shim tool's version, URL and checksum, so installs

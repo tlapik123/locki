@@ -330,8 +330,6 @@ chmod +x /opt/locki/bin/high/*
 mkdir -p /opt/locki/bin/low
 
 ## NPM packages
-## allow_builds: mise's embedded installer skips lifecycle scripts by default, but Claude Code
-## (and other CLIs shipping native binaries) place their binary from postinstall.
 for pair in \
   "@anthropic-ai/claude-code=claude" \
   "@mariozechner/pi-coding-agent=pi" \
@@ -345,7 +343,7 @@ for pair in \
 #!/bin/bash
 set -eo pipefail
 if ! locki-command-real $bin >/dev/null 2>&1; then
-  /opt/locki/bin/high/locki-auto-install $pkg /opt/locki/bin/high/locki-mise-install "npm:$pkg[allow_builds=true]"
+  /opt/locki/bin/high/locki-auto-install $pkg /opt/locki/bin/high/locki-mise-install npm:$pkg
 fi
 exec "\$(locki-command-real $bin)" "\$@"
 EOF
