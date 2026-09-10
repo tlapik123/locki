@@ -697,6 +697,12 @@ git -C "$REPO" checkout -q -- pull-me.txt
 assert_ok "tmp artifact pull" locki file pull -m "$FILE_ID" .locki/tmp/artifact.txt
 assert_output "tmp artifact lands 1:1" "artifact" cat "$REPO/.locki/tmp/artifact.txt"
 
+mkdir -p "$FILE_WT/ignored-build/sub"
+printf 'sub/\n' > "$FILE_WT/ignored-build/.gitignore"  # an untracked .gitignore still ignores
+echo built > "$FILE_WT/ignored-build/sub/out.bin"
+assert_output "gitignored dir pulls when asked for explicitly" '"pulled": ["ignored-build/sub/out.bin"]' locki file pull -m "$FILE_ID" --json ignored-build/sub
+rm -rf "$REPO/ignored-build" "$FILE_WT/ignored-build"
+
 ln -s /etc/passwd "$FILE_WT/sneaky-link"
 assert_fail "symlink pull rejected" locki file pull -m "$FILE_ID" sneaky-link
 assert_fail ".git pull rejected" locki file pull -m "$FILE_ID" .git

@@ -47,10 +47,9 @@ def _unsaved_work(worktree: WorktreeInfo) -> dict[str, list[str]]:
     return lost
 
 
-def _rescue_jobs(worktree: WorktreeInfo) -> list[tuple[pathlib.Path, pathlib.Path, list[str]]]:
-    jobs = [
-        (worktree.path, worktree.repo, transfer.changed_files(worktree.path) + transfer.locki_tmp_files(worktree.path))
-    ]
+def _rescue_jobs(worktree: WorktreeInfo, ignored: list[str]) -> list[tuple[pathlib.Path, pathlib.Path, list[str]]]:
+    files = transfer.changed_files(worktree.path) + transfer.locki_tmp_files(worktree.path)
+    jobs = [(worktree.path, worktree.repo, files + transfer.expand_dirs(worktree.path, ignored))]
     for inc in worktree.include:
         inc_path = worktree.include_path(inc.name)
         if inc_path.exists():
@@ -84,9 +83,16 @@ def _interactive_rescue(worktree: WorktreeInfo, lost: dict[str, list[str]]) -> N
     if action == "delete":
         return
 
+    ignored: list[str] = []
+    if candidates := transfer.ignored_entries(worktree.path):
+        ignored = inquirer.checkbox(
+            message="Also pull gitignored files? (never pulled unless picked)",
+            choices=[Choice(value=p, name=p, enabled=False) for p in candidates],
+        ).execute()
+
     # dry-classify ALL jobs before copying anything, so an abort at the clash
     # prompt really leaves every host repo untouched
-    jobs = _rescue_jobs(worktree)
+    jobs = _rescue_jobs(worktree, ignored)
     clashes = [(dst, c) for src, dst, rels in jobs for c in transfer.classify(src, dst, rels).clashes]
     policy: transfer.ClashPolicy = "abort"
     if clashes:

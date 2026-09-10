@@ -35,6 +35,21 @@ def untracked_files(root: pathlib.Path, *, include_ignored: bool = False) -> lis
     return _git_lines(root, "ls-files", "--others", *exclude, "-z")
 
 
+def ignored_entries(root: pathlib.Path) -> list[str]:
+    """Gitignored files of *root*, whole ignored directories collapsed to `dir/`
+    (so build/ or .venv/ is one checklist entry). Symlinks (cache links) and
+    .git/.locki are left out. Never pulled implicitly -- only when picked."""
+    entries = _git_lines(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
+    # with name-based rules (*.pyc) git lists a dir AND its ignored descendants; keep only the topmost
+    out: list[str] = []
+    for p in sorted(entries):
+        if _excluded(pathlib.Path(p), allow_locki_tmp=False) or (root / p).is_symlink():
+            continue
+        if not any(p.startswith(d) for d in out if d.endswith("/")):
+            out.append(p)
+    return out
+
+
 def _excluded(rel: pathlib.Path, *, allow_locki_tmp: bool) -> bool:
     """The one exclusion rule: .git never transfers; .locki is sandbox-internal,
     except .locki/tmp where the caller allows it (pulls)."""

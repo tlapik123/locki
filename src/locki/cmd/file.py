@@ -49,7 +49,8 @@ def _transfer(
     else:
         pre_checked = transfer.changed_files(src_root)
         unchecked = transfer.locki_tmp_files(src_root) if allow_locki_tmp else []
-        if not pre_checked and not unchecked:
+        ignored = transfer.ignored_entries(src_root)
+        if not pre_checked and not unchecked and not ignored:
             click.echo(f"{INFO} Nothing to {action} in {pretty_path(src_root)}.", err=True)
             emit_json(transfer.CopyResult())
             return
@@ -59,7 +60,10 @@ def _transfer(
         from InquirerPy.base.control import Choice
 
         choices = [Choice(value=p, name=p, enabled=p in pre_checked) for p in [*pre_checked, *unchecked]]
-        rels = inquirer.checkbox(message="Select files to transfer:", choices=choices).execute()
+        choices += [Choice(value=p, name=f"{p}  (gitignored)", enabled=False) for p in ignored]
+        rels = transfer.expand_dirs(
+            src_root, inquirer.checkbox(message="Select files to transfer:", choices=choices).execute()
+        )
     if not rels and not outside:
         click.echo(f"{INFO} Nothing selected.", err=True)
         emit_json(transfer.CopyResult())
