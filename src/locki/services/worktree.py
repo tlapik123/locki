@@ -19,7 +19,7 @@ import click
 from locki.paths import PACKAGE_DATA, WORKTREES, WORKTREES_META, XDG_CONFIG
 from locki.runes import INFO, WARNING
 from locki.services.home import home
-from locki.services.transfer import untracked_files
+from locki.services.transfer import blocked_ancestor, ignored_entries, untracked_files
 from locki.utils import check_dirty_applies, fail, format_age, pretty_path, run_command
 
 GIT_HOOKS = [
@@ -304,6 +304,11 @@ class WorktreeService:
             check=False,
             quiet=True,
         )
+        if stash.returncode != 0:
+            fail(
+                f"Snapshotting uncommitted changes failed: {stash.stderr.decode().strip() or 'git stash create error'}"
+                f" (intent-to-add entries from 'git add -N' can cause this). Resolve it or create without --dirty."
+            )
         sha = stash.stdout.decode().strip()
         untracked = [
             p for p in untracked_files(repo, include_ignored=raw) if pathlib.Path(p).parts[0] not in (".locki", ".git")
@@ -332,20 +337,32 @@ class WorktreeService:
                     f" conflict markers were left in {pretty_path(wt_path)} for resolution.",
                     err=True,
                 )
-        wt_real = wt_path.resolve()
         for rel in untracked:
             src, dst = repo / rel, wt_path / rel
-            if dst.is_symlink() or not dst.parent.resolve().is_relative_to(wt_real):
-                # a diverged --from base may hold a symlink where the host has a
-                # file -- writing through it would land outside this path
-                click.echo(f"{WARNING} Skipping {rel}: its destination sits behind a symlink.", err=True)
+            in_the_way = (
+                dst.is_symlink()
+                or dst.is_dir()
+                or (src.is_dir() and dst.exists())
+                or blocked_ancestor(wt_path, rel.rstrip("/"))
+            )
+            if in_the_way:
+                # a diverged --from base may hold a symlink, directory, or file
+                # where the host has something else -- copying through, into, or
+                # onto it would misplace the content
+                click.echo(f"{WARNING} Skipping {rel}: the sandbox base has a conflicting path there.", err=True)
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             if src.is_dir() and not src.is_symlink():
                 # ls-files doesn't recurse into a nested git repo; it emits one
                 # "dir/" entry -- copy it wholesale, .git included (it is part
-                # of the host's uncommitted state)
-                shutil.copytree(src, dst, symlinks=True)
+                # of the host's uncommitted state). Its gitignored files stay
+                # behind though, unless --raw opted into them.
+                skip = {src / p.rstrip("/") for p in ([] if raw else ignored_entries(src))}
+
+                def ignore(d, names, skip=skip):
+                    return [n for n in names if pathlib.Path(d) / n in skip]
+
+                shutil.copytree(src, dst, symlinks=True, ignore=ignore)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
         if raw and (ignored := set(untracked) - set(untracked_files(repo))):

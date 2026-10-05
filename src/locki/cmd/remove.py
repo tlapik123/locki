@@ -14,22 +14,39 @@ from locki.utils import fail, json_option, run_command, sandbox_options
 logger = logging.getLogger(__name__)
 
 
-def _porcelain(root: pathlib.Path) -> list[str]:
+def _porcelain(root: pathlib.Path) -> list[tuple[str, str]]:
+    """(XY status, path) entries; -z output is NUL-delimited and never quoted."""
     result = run_command(
-        ["git", "-C", str(root), "-c", "core.quotepath=false", "status", "--porcelain", "--untracked-files=all"],
+        ["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
         "Checking for changes",
         check=False,
         quiet=True,
     )
-    return [line for line in result.stdout.decode().splitlines() if line.strip()]
+    entries: list[tuple[str, str]] = []
+    fields = iter(result.stdout.decode().split("\0"))
+    for field in fields:
+        if not field:
+            continue
+        xy = field[:2]
+        if "R" in xy or "C" in xy:
+            next(fields, None)  # a rename/copy record carries the original path in an extra field
+        entries.append((xy, field[3:]))
+    return entries
+
+
+def _staged_divergent(xy: str) -> bool:
+    """A staged version differing from the working tree lives only in the
+    sandbox's index -- a copy of the working tree does not cover it."""
+    return xy[0] not in " ?" and xy[1] != " "
 
 
 def _losable_now(src: pathlib.Path, dst: pathlib.Path) -> list[str]:
     """Porcelain lines of *src* whose content is not already saved at its 1:1
     path in *dst* (a prior `locki file pull` rescues files ahead of time).
-    Anything rescue can't copy -- deletions, symlinks, nested repos -- always counts."""
+    Anything rescue can't copy -- deletions, symlinks, nested repos -- always
+    counts, as does a staged version differing from the working tree."""
     saved = set(transfer.classify(src, dst, transfer.changed_files(src)).identical)
-    return [line for line in _porcelain(src) if line[3:].split(" -> ")[-1] not in saved]
+    return [f"{xy} {path}" for xy, path in _porcelain(src) if _staged_divergent(xy) or path not in saved]
 
 
 def _unsaved_work(worktree: WorktreeInfo) -> dict[str, list[str]]:
@@ -47,13 +64,19 @@ def _unsaved_work(worktree: WorktreeInfo) -> dict[str, list[str]]:
     return lost
 
 
-def _rescue_jobs(worktree: WorktreeInfo, ignored: list[str]) -> list[tuple[pathlib.Path, pathlib.Path, list[str]]]:
-    files = transfer.changed_files(worktree.path) + transfer.locki_tmp_files(worktree.path)
-    jobs = [(worktree.path, worktree.repo, files + transfer.expand_dirs(worktree.path, ignored))]
+def _rescue_jobs(worktree: WorktreeInfo) -> list[tuple[str, pathlib.Path, pathlib.Path, list[str]]]:
+    jobs = [
+        (
+            "",
+            worktree.path,
+            worktree.repo,
+            transfer.changed_files(worktree.path) + transfer.locki_tmp_files(worktree.path),
+        )
+    ]
     for inc in worktree.include:
         inc_path = worktree.include_path(inc.name)
         if inc_path.exists():
-            jobs.append((inc_path, inc.repo, transfer.changed_files(inc_path)))
+            jobs.append((inc.name, inc_path, inc.repo, transfer.changed_files(inc_path)))
     return jobs
 
 
@@ -83,17 +106,37 @@ def _interactive_rescue(worktree: WorktreeInfo, lost: dict[str, list[str]]) -> N
     if action == "delete":
         return
 
-    ignored: list[str] = []
-    if candidates := transfer.ignored_entries(worktree.path):
-        ignored = inquirer.checkbox(
-            message="Also pull gitignored files? (never pulled unless picked)",
-            choices=[Choice(value=p, name=p, enabled=False) for p in candidates],
-        ).execute()
+    jobs = _rescue_jobs(worktree)
+    ignored = transfer.ignored_entries(worktree.path)
+    choices = [
+        Choice(value=(i, rel), name=f"{label}: {rel}" if label else rel, enabled=True)
+        for i, (label, _src, _dst, rels) in enumerate(jobs)
+        for rel in rels
+    ] + [Choice(value=(0, rel), name=f"{rel}  (gitignored)", enabled=False) for rel in ignored]
+    if not choices:
+        click.echo(
+            f"{INFO} None of this can be pulled -- deletions, symlinks, and nested repos have no copyable file.",
+            err=True,
+        )
+        if not inquirer.confirm(message="Remove anyway (lose them)?", default=False).execute():
+            raise SystemExit(1)
+        return
+    from locki.cmd.file import checkbox_prompt
+
+    offered = {c.value for c in choices}
+    selected = set(checkbox_prompt("Files to pull (unchecked ones are lost):", choices))
+    picked = [
+        (
+            src,
+            dst,
+            transfer.expand_dirs(src, [rel for rel in [*rels, *(ignored if i == 0 else [])] if (i, rel) in selected]),
+        )
+        for i, (_, src, dst, rels) in enumerate(jobs)
+    ]
 
     # dry-classify ALL jobs before copying anything, so an abort at the clash
     # prompt really leaves every host repo untouched
-    jobs = _rescue_jobs(worktree, ignored)
-    clashes = [(dst, c) for src, dst, rels in jobs for c in transfer.classify(src, dst, rels).clashes]
+    clashes = [(dst, c) for src, dst, rels in picked for c in transfer.classify(src, dst, rels).clashes]
     policy: transfer.ClashPolicy = "abort"
     if clashes:
         dirs = [rel for dst, rel in clashes if (dst / rel).is_dir() and not (dst / rel).is_symlink()]
@@ -111,9 +154,32 @@ def _interactive_rescue(worktree: WorktreeInfo, lost: dict[str, list[str]]) -> N
             raise SystemExit(1)
         policy = clash_action
 
-    for src_root, dst_root, rels in jobs:
-        for rel in transfer.copy_files(src_root, dst_root, rels, clash_policy=policy).copied:
+    for src_root, dst_root, rels in picked:
+        result = transfer.copy_files(src_root, dst_root, rels, clash_policy=policy)
+        for rel in result.copied:
             click.echo(f"{SUCCESS} Pulled {rel}", err=True)
+        if result.clashes and policy == "abort":
+            # the host changed between the dry classification and this copy
+            fail(
+                f"The host repo changed while rescuing; not pulled: {', '.join(result.clashes)}."
+                f" Nothing was removed -- rerun."
+            )
+
+    # a staged version differing from the working tree has no 1:1 destination:
+    # pulling saved at most the working-tree copy, so losing it needs an explicit
+    # OK -- unless the file was offered and deliberately unchecked (loss accepted)
+    stuck = []
+    for i, (label, src, _dst, _rels) in enumerate(jobs):
+        for xy, path in _porcelain(src):
+            if _staged_divergent(xy) and ((i, path) in selected or (i, path) not in offered):
+                stuck.append(f"{label}: {path}" if label else path)
+    if stuck:
+        click.echo(f"{WARNING} Staged versions of these files differ from the pulled copies (only", err=True)
+        click.echo(f"{WARNING} the working-tree content was pulled; the staged one cannot be):", err=True)
+        for s in stuck:
+            click.echo(f"{WARNING}     {s}", err=True)
+        if not inquirer.confirm(message="Remove anyway (lose those staged versions)?", default=False).execute():
+            raise SystemExit(1)
 
 
 def remove_sandbox(worktree: WorktreeInfo, *, branches: bool, force: bool, as_json: bool) -> None:

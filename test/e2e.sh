@@ -615,12 +615,15 @@ echo unstaged >> "$REPO/dirty-b.txt"
 echo untracked > "$REPO/dirty-untracked.txt"
 git init -q "$REPO/dirty-nested"  # untracked nested repo: ls-files emits one "dir/" entry
 echo n > "$REPO/dirty-nested/f.txt"
+printf 'nested-secret.env\n' > "$REPO/dirty-nested/.gitignore"
+echo s > "$REPO/dirty-nested/nested-secret.env"
 
 HOST_STATUS_BEFORE=$(git -C "$REPO" status --porcelain)
 DIRTY_WT=$(locki new --dirty --json 2>/dev/null | json_field path)
 assert_ok "untracked file replicated" test -f "$DIRTY_WT/dirty-untracked.txt"
 assert_ok "untracked nested git repo replicated" test -f "$DIRTY_WT/dirty-nested/f.txt"
 assert_ok "nested repo's .git replicated" test -e "$DIRTY_WT/dirty-nested/.git"
+assert_fail "nested repo's gitignored file stays behind with --dirty" test -e "$DIRTY_WT/dirty-nested/nested-secret.env"
 assert_output "staged change replicated as staged" "dirty-a.txt" git -C "$DIRTY_WT" diff --cached --name-only
 assert_output "unstaged change replicated as unstaged" "dirty-b.txt" git -C "$DIRTY_WT" diff --name-only
 HOST_STATUS_AFTER=$(git -C "$REPO" status --porcelain)
@@ -634,6 +637,7 @@ assert_fail "--dirty leaves gitignored files behind" test -e "$DIRTY2_WT/rawdir/
 RAW_WT=$(locki new --raw --json 2>/dev/null | json_field path)
 assert_ok "--raw carries gitignored files" test -f "$RAW_WT/rawdir/secret.env"
 assert_ok "--raw carries plain untracked files too" test -f "$RAW_WT/rawdir/.gitignore"
+assert_ok "--raw carries nested repo's gitignored file" test -f "$RAW_WT/dirty-nested/nested-secret.env"
 rm -rf "$REPO/rawdir"
 
 assert_fail "--dirty on existing sandbox fails" env SHELL="$(command -v true)" locki cd --dirty -m "$AUTH"
@@ -663,6 +667,43 @@ assert_ok "--dirty from a base with a symlink in the way proceeds" \
 assert_fail "nothing written through the base's symlink" test -e "$LEAK_DIR/inside.txt"
 rm -rf "$REPO/shared"
 git -C "$REPO" branch -qD dirty-symlink-base
+
+# base has a committed directory where the host has an untracked file: copying
+# the file "into" it would misplace it as blockdir/blockdir
+git -C "$REPO" switch -qc dirty-dir-base
+mkdir "$REPO/blockdir"
+echo inner > "$REPO/blockdir/inner.txt"
+git -C "$REPO" add blockdir
+git -C "$REPO" commit -qm "dir base" --no-verify
+git -C "$REPO" switch -q -
+echo host-file > "$REPO/blockdir"
+DIRBASE_WT=$(locki new --dirty -f dirty-dir-base --force --json </dev/null 2>/dev/null | json_field path)
+assert_fail "untracked file skipped when the base has a directory there" test -e "$DIRBASE_WT/blockdir/blockdir"
+assert_output "base's directory content intact" "inner" cat "$DIRBASE_WT/blockdir/inner.txt"
+rm -f "$REPO/blockdir"
+git -C "$REPO" branch -qD dirty-dir-base
+
+# base has an in-tree symlink where the host has a directory: copying through
+# it would land the file at the symlink's target path instead of its own
+git -C "$REPO" switch -qc dirty-alias-base
+mkdir "$REPO/aliastarget"
+echo keep > "$REPO/aliastarget/keep.txt"
+ln -s aliastarget "$REPO/alias"
+git -C "$REPO" add aliastarget alias
+git -C "$REPO" commit -qm "alias base" --no-verify
+git -C "$REPO" switch -q -
+mkdir -p "$REPO/alias"
+echo sneaky > "$REPO/alias/file.txt"
+ALIAS_WT=$(locki new --dirty -f dirty-alias-base --force --json </dev/null 2>/dev/null | json_field path)
+assert_fail "untracked file not written through the base's in-tree symlink" test -e "$ALIAS_WT/aliastarget/file.txt"
+rm -rf "$REPO/alias"
+git -C "$REPO" branch -qD dirty-alias-base
+
+echo ita > "$REPO/intent.txt"
+git -C "$REPO" add -N intent.txt  # intent-to-add makes 'git stash create' fail
+assert_fail "--dirty fails loudly when the snapshot cannot be taken" bash -c "locki new --dirty --json </dev/null"
+git -C "$REPO" reset -q
+rm -f "$REPO/intent.txt"
 
 # ── locki file pull/push ─────────────────────────────────────────────────────
 
@@ -746,10 +787,65 @@ assert_fail "directory refusal is atomic (sibling not copied)" test -f "$REPO/di
 rmdir "$REPO/dir-clash"
 
 assert_ok "sync content ahead of the x-bit test" locki file pull -m "$FILE_ID" pull-me.txt
+git -C "$REPO" add pull-me.txt  # commit the sync: the x-bit test needs a clean tracked destination
+git -C "$REPO" commit -qm "sync for x-bit test" --no-verify
 chmod +x "$FILE_WT/pull-me.txt"  # bytes equal, only the executable bit differs
 assert_output "x-bit-only change still pulls" '"pulled": ["pull-me.txt"]' locki file pull -m "$FILE_ID" --json pull-me.txt
 assert_ok "pulled file carries the executable bit" test -x "$REPO/pull-me.txt"
 git -C "$REPO" checkout -q -- pull-me.txt
+
+echo committed > "$REPO/assume.txt"
+git -C "$REPO" add assume.txt
+git -C "$REPO" commit -qm "assume-unchanged fixture" --no-verify
+echo sandbox-version > "$FILE_WT/assume.txt"
+git -C "$REPO" update-index --assume-unchanged assume.txt  # makes 'git diff HEAD' lie about local edits
+echo local-edit > "$REPO/assume.txt"
+assert_fail "assume-unchanged destination with edits still clashes" locki file pull -m "$FILE_ID" assume.txt
+assert_output "the local edit survived" "local-edit" cat "$REPO/assume.txt"
+git -C "$REPO" update-index --no-assume-unchanged assume.txt
+git -C "$REPO" checkout -q -- assume.txt
+
+git -C "$REPO" update-index --assume-unchanged assume.txt
+chmod +x "$REPO/assume.txt"  # a mode-only local change hidden from 'git diff'
+assert_fail "x-bit change under assume-unchanged still clashes" locki file pull -m "$FILE_ID" assume.txt
+git -C "$REPO" update-index --no-assume-unchanged assume.txt
+chmod -x "$REPO/assume.txt"
+
+printf 'crlf.txt text eol=crlf\n' >> "$REPO/.gitattributes"
+printf 'line1\n' > "$REPO/crlf.txt"
+git -C "$REPO" add .gitattributes crlf.txt
+git -C "$REPO" commit -qm "crlf fixture" --no-verify
+git -C "$REPO" checkout -q -- crlf.txt  # host copy now has CRLF bytes, HEAD blob has LF
+printf 'newer\n' > "$FILE_WT/crlf.txt"
+assert_ok "eol-filtered clean destination overwrites without --force" locki file pull -m "$FILE_ID" crlf.txt
+git -C "$REPO" checkout -q -- crlf.txt
+
+echo original > "$REPO/linked.txt"
+git -C "$REPO" add linked.txt
+git -C "$REPO" commit -qm "hardlink fixture" --no-verify
+ln "$REPO/linked.txt" "$TMPDIR_ROOT/hardlink"
+echo replaced > "$FILE_WT/linked.txt"
+assert_ok "pull onto a hard-linked destination" locki file pull -m "$FILE_ID" linked.txt
+assert_output "hard-link sibling keeps its own content" "original" cat "$TMPDIR_ROOT/hardlink"
+git -C "$REPO" checkout -q -- linked.txt
+
+echo precious > "$REPO/linked.txt.locki-partial"  # unclassified sibling the temp-file dance must not touch
+echo replaced-again > "$FILE_WT/linked.txt"
+assert_ok "pull with a .locki-partial-named sibling present" locki file pull -m "$FILE_ID" linked.txt
+assert_output "sibling named like a temp file survives" "precious" cat "$REPO/linked.txt.locki-partial"
+rm -f "$REPO/linked.txt.locki-partial"
+git -C "$REPO" checkout -q -- linked.txt
+
+touch "$REPO/:(glob)test"
+git -C "$REPO" add -f -- ':(literal):(glob)test'
+git -C "$REPO" commit -qm "pathspec-magic fixture" --no-verify
+rm -f "$REPO/:(glob)test"  # uncommitted deletion; the magic name must not dodge its protection
+echo new > "$FILE_WT/:(glob)test"
+assert_fail "pathspec-magic filename can't bypass deletion protection" locki file pull -m "$FILE_ID" ':(glob)test'
+git -C "$REPO" checkout -q -- ':(literal):(glob)test'
+assert_ok "clean tracked magic-name still overwrites" locki file pull -m "$FILE_ID" ':(glob)test'
+git -C "$REPO" checkout -q -- ':(literal):(glob)test'
+rm -f "$FILE_WT/:(glob)test"
 
 mkdir -p "$FILE_WT/anc"
 echo inside > "$FILE_WT/anc/deep.txt"
@@ -765,6 +861,19 @@ ln -s "$ESC_DIR" "$REPO/anc"  # symlinked ancestor would write outside the repo
 assert_fail "pull through a symlinked ancestor refuses" locki file pull -m "$FILE_ID" anc/deep.txt
 assert_fail "nothing escaped through the symlink" test -e "$ESC_DIR/deep.txt"
 rm "$REPO/anc"
+
+mkdir -p "$FILE_WT/linked-dir"
+echo only-copy > "$FILE_WT/linked-dir/data.txt"
+ln -s "$FILE_WT/linked-dir" "$REPO/linked-dir"  # the host "copy" is really the sandbox's own dir
+assert_fail "a destination behind a symlink is a clash, not 'identical'" locki file pull -m "$FILE_ID" linked-dir/data.txt
+rm "$REPO/linked-dir"
+
+mkdir -p "$TMPDIR_ROOT/dup-a" "$TMPDIR_ROOT/dup-b"
+echo a > "$TMPDIR_ROOT/dup-a/report.txt"
+echo b > "$TMPDIR_ROOT/dup-b/report.txt"
+assert_fail "outside pushes with duplicate basenames rejected" \
+    locki file push -m "$FILE_ID" "$TMPDIR_ROOT/dup-a/report.txt" "$TMPDIR_ROOT/dup-b/report.txt"
+assert_fail "duplicate-basename refusal copied nothing" test -e "$FILE_WT/.locki/tmp/report.txt"
 
 echo dot > "$FILE_WT/dot-pull.txt"
 assert_ok "pull . expands the whole tree" locki file pull -m "$FILE_ID" --force .
@@ -811,6 +920,26 @@ git init -q "$NESTED_WT/nested-work"  # uncopyable dirty entry: rescue can't pul
 echo w > "$NESTED_WT/nested-work/f.txt"
 assert_fail "rm blocks on an untracked nested repo" bash -c "locki rm -m '$NESTED_ID' </dev/null"
 assert_ok "rm --force removes sandbox with nested repo" bash -c "locki rm -m '$NESTED_ID' --force </dev/null"
+
+SPACEY_OUT=$(locki new --json 2>/dev/null)
+SPACEY_ID=$(printf '%s\n' "$SPACEY_OUT" | json_field id)
+SPACEY_WT=$(printf '%s\n' "$SPACEY_OUT" | json_field path)
+echo x > "$SPACEY_WT/two words.txt"  # porcelain quotes such names; -z parsing must not care
+assert_ok "pull a filename with spaces" locki file pull -m "$SPACEY_ID" "two words.txt"
+assert_ok "rm proceeds: spacey filename counted as saved" bash -c "locki rm -m '$SPACEY_ID' </dev/null"
+rm -f "$REPO/two words.txt"
+
+SPLIT_OUT=$(locki new --json 2>/dev/null)
+SPLIT_ID=$(printf '%s\n' "$SPLIT_OUT" | json_field id)
+SPLIT_WT=$(printf '%s\n' "$SPLIT_OUT" | json_field path)
+echo staged-version > "$SPLIT_WT/split.txt"
+git -C "$SPLIT_WT" add split.txt
+echo worktree-version > "$SPLIT_WT/split.txt"  # staged != worktree
+assert_ok "pull the worktree version" locki file pull -m "$SPLIT_ID" split.txt
+assert_fail "rm still blocks: the staged version lives only in the sandbox index" \
+    bash -c "locki rm -m '$SPLIT_ID' </dev/null"
+assert_ok "cleanup split sandbox" bash -c "locki rm -m '$SPLIT_ID' --force </dev/null"
+rm -f "$REPO/split.txt"
 
 INC_SRC="$TMPDIR_ROOT/inc-src"
 git init -q "$INC_SRC"

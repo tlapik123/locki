@@ -12,6 +12,7 @@ import errno
 import filecmp
 import os
 import pathlib
+import secrets
 import shutil
 import stat
 import typing
@@ -148,7 +149,8 @@ class CopyResult:
 def _is_recoverable(dst_root: pathlib.Path, rel: str) -> bool:
     """Whether overwriting dst_root/rel loses nothing: tracked and clean vs HEAD."""
     tracked = run_command(
-        ["git", "-C", str(dst_root), "ls-files", "--error-unmatch", "--", rel],
+        # :(literal) so a filename like ":(glob)x" can't smuggle pathspec magic past the check
+        ["git", "-C", str(dst_root), "ls-files", "--error-unmatch", "--", f":(literal){rel}"],
         "Checking destination tracking",
         check=False,
         quiet=True,
@@ -159,13 +161,52 @@ def _is_recoverable(dst_root: pathlib.Path, rel: str) -> bool:
 
 
 def _clean_vs_head(dst_root: pathlib.Path, rel: str) -> bool:
-    cmd = ["git", "-C", str(dst_root), "diff", "--quiet", "HEAD", "--", rel]
-    return run_command(cmd, "Checking destination cleanliness", check=False, quiet=True).returncode == 0
+    cmd = ["git", "-C", str(dst_root), "diff", "--quiet", "HEAD", "--", f":(literal){rel}"]
+    if run_command(cmd, "Checking destination cleanliness", check=False, quiet=True).returncode != 0:
+        return False
+    # assume-unchanged / skip-worktree make diff trust a stale index; verify for
+    # real, hashing through git so clean/eol filters don't fake a difference
+    entry = (
+        run_command(
+            ["git", "-C", str(dst_root), "ls-tree", "-z", "HEAD", "--", f":(literal){rel}"],
+            "Reading committed entry",
+            check=False,
+            quiet=True,
+        )
+        .stdout.decode()
+        .strip("\0\n ")
+    )
+    dst = dst_root / rel
+    if not entry:  # not in HEAD: clean iff nothing is there either
+        return not dst.exists() and not dst.is_symlink()
+    mode, _obj, oid = entry.split("\t", 1)[0].split(" ")
+    if mode not in ("100644", "100755") or not dst.is_file() or dst.is_symlink():
+        return False
+    if (dst.stat().st_mode & 0o100 != 0) != (mode == "100755"):
+        return False
+    hashed = run_command(
+        ["git", "-C", str(dst_root), "hash-object", f"--path={rel}", "--", str(dst)],
+        "Hashing destination content",
+        check=False,
+        quiet=True,
+    )
+    return hashed.returncode == 0 and hashed.stdout.decode().strip() == oid
 
 
 def _same_mode(a: pathlib.Path, b: pathlib.Path) -> bool:
     """Git tracks only the executable bit -- that is the mode identity."""
     return (a.stat().st_mode & 0o100) == (b.stat().st_mode & 0o100)
+
+
+def blocked_ancestor(dst_root: pathlib.Path, rel: str) -> pathlib.Path | None:
+    """The first destination ancestor that is not a real directory (a symlink or
+    a file), or None. A path behind a symlink has no independent 1:1 copy."""
+    for p in (dst_root / rel).parents:
+        if p == dst_root or not p.is_relative_to(dst_root):
+            return None
+        if p.is_symlink() or (p.exists() and not p.is_dir()):
+            return p
+    return None
 
 
 def classify(src_root: pathlib.Path, dst_root: pathlib.Path, rel_paths: list[str]) -> CopyResult:
@@ -179,7 +220,7 @@ def classify(src_root: pathlib.Path, dst_root: pathlib.Path, rel_paths: list[str
     result = CopyResult()
     for rel in rel_paths:
         dst = dst_root / rel
-        if dst.is_symlink() or dst.is_dir():
+        if blocked_ancestor(dst_root, rel) or dst.is_symlink() or dst.is_dir():
             result.clashes.append(rel)
         elif not dst.exists():
             # recreating a file whose deletion is staged/unstaged would undo it
@@ -215,6 +256,10 @@ def copy_files(
     """
     plan = classify(src_root, dst_root, rel_paths)
     out_map = {f".locki/tmp/{f.name}": f for f in outside}
+    if len(out_map) != len(outside):
+        names = [f.name for f in outside]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        fail(f"Outside files share a basename and would overwrite each other in .locki/tmp: {', '.join(dupes)}.")
     for rel, f in out_map.items():
         dst = dst_root / rel
         if dst.is_symlink() or dst.is_dir():
@@ -238,14 +283,11 @@ def copy_files(
     if dirs := [rel for rel in to_copy if (dst_root / rel).is_dir() and not (dst_root / rel).is_symlink()]:
         fail(f"Cannot copy over a directory (nothing was copied): {', '.join(dirs)}. Remove it first.")
     for rel in to_copy:
-        for p in (dst_root / rel).parents:
-            if p == dst_root or not p.is_relative_to(dst_root):
-                break
-            if p.is_symlink() or (p.exists() and not p.is_dir()):
-                fail(
-                    f"Cannot copy {rel} (nothing was copied):"
-                    f" {p.relative_to(dst_root)} is not a real directory. Remove it first."
-                )
+        if p := blocked_ancestor(dst_root, rel):
+            fail(
+                f"Cannot copy {rel} (nothing was copied):"
+                f" {p.relative_to(dst_root)} is not a real directory. Remove it first."
+            )
 
     for rel in to_copy:
         try:
@@ -287,18 +329,27 @@ def _copy_nofollow(
             opened.append(src_fd := os.open(src_file, os.O_RDONLY))
         if not stat.S_ISREG(os.fstat(src_fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        wflags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-        try:
-            dst_fd = os.open(parts[-1], wflags, dir_fd=dfd)
-        except OSError as e:
-            if e.errno != errno.ELOOP:
-                raise
-            os.unlink(parts[-1], dir_fd=dfd)  # overwriting a symlink clash drops the link, not its target
-            dst_fd = os.open(parts[-1], wflags, dir_fd=dfd)
+        # write a fresh inode and rename it into place: never truncates a
+        # hard-linked destination's shared inode, and atomically replaces a
+        # symlink entry (the link, not its target). The name is unique and
+        # O_EXCL-claimed, so no existing file is ever touched.
+        for _ in range(3):
+            tmp = f"{parts[-1]}.{secrets.token_hex(4)}.locki-partial"
+            with contextlib.suppress(FileExistsError):
+                dst_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, dir_fd=dfd)
+                break
+        else:
+            raise OSError(errno.EEXIST, "could not allocate a temporary file")
         opened.append(dst_fd)
-        with os.fdopen(os.dup(src_fd), "rb") as s, os.fdopen(os.dup(dst_fd), "wb") as d:
-            shutil.copyfileobj(s, d)
-        os.fchmod(dst_fd, os.fstat(src_fd).st_mode & 0o777)  # never propagate setuid/setgid to the host
+        try:
+            with os.fdopen(os.dup(src_fd), "rb") as s, os.fdopen(os.dup(dst_fd), "wb") as d:
+                shutil.copyfileobj(s, d)
+            os.fchmod(dst_fd, os.fstat(src_fd).st_mode & 0o777)  # never propagate setuid/setgid to the host
+            os.rename(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp, dir_fd=dfd)
+            raise
     finally:
         for fd in opened:
             os.close(fd)

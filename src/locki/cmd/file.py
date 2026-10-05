@@ -6,6 +6,7 @@ worktree (push) and are deliberately NOT part of the sandbox command bridge
 """
 
 import json
+import os
 import pathlib
 import sys
 import typing
@@ -23,6 +24,18 @@ def file_app():
     """Copy files between a sandbox worktree and the host repo (1:1 paths)."""
 
 
+def checkbox_prompt(message: str, choices: list) -> list:
+    """Multi-select where space toggles AND advances (like Tab); ctrl+a selects all."""
+    from InquirerPy import inquirer
+
+    return inquirer.checkbox(
+        message=message,
+        choices=choices,
+        keybindings={"toggle": [], "toggle-down": [{"key": "space"}, {"key": "c-i"}]},
+        instruction="(space: pick, ctrl+a: all, enter: confirm)",
+    ).execute()
+
+
 def _transfer(
     src_root: pathlib.Path,
     dst_root: pathlib.Path,
@@ -34,6 +47,7 @@ def _transfer(
     past: str,
     json_key: str,
     allow_locki_tmp: bool,
+    pre_check: bool = True,
     outside: typing.Sequence[pathlib.Path] = (),
 ) -> None:
     def emit_json(result: transfer.CopyResult) -> None:
@@ -56,14 +70,15 @@ def _transfer(
             return
         if not sys.stdin.isatty():
             fail("No paths given. Pass paths explicitly in non-interactive mode.")
-        from InquirerPy import inquirer
         from InquirerPy.base.control import Choice
 
-        choices = [Choice(value=p, name=p, enabled=p in pre_checked) for p in [*pre_checked, *unchecked]]
-        choices += [Choice(value=p, name=f"{p}  (gitignored)", enabled=False) for p in ignored]
-        rels = transfer.expand_dirs(
-            src_root, inquirer.checkbox(message="Select files to transfer:", choices=choices).execute()
-        )
+        choices = [Choice(value=p, name=p, enabled=pre_check and p in pre_checked) for p in [*pre_checked, *unchecked]]
+        for p in ignored:
+            note = "gitignored"
+            if p.endswith("/"):  # a collapsed fully-ignored directory: show what's inside
+                note = f"gitignored dir, {sum(len(names) for _, _, names in os.walk(src_root / p))} files"
+            choices.append(Choice(value=p, name=f"{p}  ({note})", enabled=False))
+        rels = transfer.expand_dirs(src_root, checkbox_prompt("Select files to transfer:", choices))
     if not rels and not outside:
         click.echo(f"{INFO} Nothing selected.", err=True)
         emit_json(transfer.CopyResult())
@@ -158,5 +173,6 @@ def file_push_cmd(match, interactive, force, as_json, paths):
         past="Pushed",
         json_key="pushed",
         allow_locki_tmp=False,
+        pre_check=False,  # pushing host files into a sandbox is deliberate; nothing pre-picked
         outside=outside,
     )
