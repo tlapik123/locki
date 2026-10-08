@@ -14,10 +14,11 @@ from locki.utils import CLEAR_LINE, check_dirty_applies, pretty_path, sandbox_op
 
 
 def enter_sandbox(
-    worktree: WorktreeInfo, command: list[str], *, dirty: bool = False, raw: bool = False
+    worktree: WorktreeInfo, command: list[str], *, dirty: bool = False, raw: bool = False, agent: str | None = None
 ) -> typing.NoReturn:
     """Bring up everything a sandbox needs (home, VM, worktree, container, daemon),
-    run *command* in it interactively, and exit with its return code."""
+    run *command* in it interactively, and exit with its return code.
+    *agent* is the explicitly chosen agent name, echoed in the "return to this sandbox" hint."""
     check_dirty_applies(dirty or raw, worktree.path.exists())  # fail fast, before the VM spin-up
 
     click.echo(f"{SPINNER} Entering a Locki sandbox.", err=True)
@@ -42,7 +43,7 @@ def enter_sandbox(
     click.echo(f"{EXIT} Exited Locki sandbox.", err=True)
     click.echo(f"{INFO} Return to this sandbox:", err=True)
     click.echo(
-        f"{INFO}      via AI: {click.style(f'locki ai -m {worktree.wt_id}', fg='green')}"
+        f"{INFO}      via AI: {click.style(f'locki ai -m {worktree.wt_id}' + (f' {agent}' if agent else ''), fg='green')}"
         f" (or just {click.style('locki ai', fg='green')} and find it in the list)",
         err=True,
     )

@@ -5,6 +5,12 @@ Incus container in a shared Lima VM, isolated from the host repo and home.
 
 ## Language
 
+**Agent**:
+The AI coding CLI (Claude Code, Codex, OpenCode, ...) that `locki ai` launches
+inside a sandbox; `ai_command` is its configured command line.
+_Avoid_: harness (means the scaffold around a model, so Claude Code *and* the
+sandbox both qualify), AI, session
+
 **Sandbox**:
 A worktree plus its Incus container; the unit users create, enter, stop, and remove.
 _Avoid_: container, VM, environment
