@@ -1,12 +1,20 @@
 import base64
+import dataclasses
+import datetime
 import hashlib
+import json
 import pathlib
 import shlex
 import subprocess
 import typing
 
+import click
+
 from locki.config import load_config
 from locki.paths import PACKAGE_DATA, WORKTREES
+from locki.runes import INFO
+from locki.services.daemon import VERSION
+from locki.services.tools import TOOLS_BIN, TOOLS_CONFIG
 from locki.services.vm import INTERCEPTED_HOSTS, vm
 from locki.services.worktree import WorktreeInfo
 from locki.utils import fail, file_lock
@@ -17,6 +25,63 @@ WORKTREE_DEVICE = "worktree"
 # Root of the per-sandbox cache folders (shared caches live in /var/cache/locki directly);
 # shims reach their sandbox's folder via the LOCKI_SCOPED_CACHE env var.
 SCOPED_CACHE = "/var/cache/locki/scoped"
+
+# Repo templates are stopped, device-less containers named after a hash of the repo path;
+# new sandboxes of the repo start as copies of them (a btrfs snapshot, so near-instant).
+TEMPLATE_PREFIX = "locki-template-"
+_TEMPLATE_KEY = "user.locki-template."
+
+
+@dataclasses.dataclass
+class TemplateInfo:
+    name: str  # incus container name
+    repo: str
+    source: str  # sandbox id the template was taken from
+    branch: str  # that sandbox's branch at the time
+    created: str  # ISO timestamp
+    version: str  # locki version that took it
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def template_name(repo: pathlib.Path) -> str:
+    return TEMPLATE_PREFIX + hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:12]
+
+
+# Runs in the VM. Snapshot first so a running source yields a crash-consistent copy, and
+# build under a temporary name so a failure leaves any previous template intact. The
+# copy loses the sandbox's own devices (worktree mount, port forwards; orphan cleanup
+# would otherwise delete it with the source worktree) and its machine-id (copies would
+# share it, and with it their DHCP client id), so each copy boots as a fresh machine.
+_TEMPLATE_SET_SCRIPT = r"""
+set -eu
+src=__SRC__ tpl=__TPL__ snap=locki-template
+tmp="$tpl-new"
+incus info "$src" >/dev/null 2>&1 || { echo "Sandbox $src has no container." >&2; exit 3; }
+incus snapshot delete "$src" "$snap" 2>/dev/null || true
+incus delete --force "$tmp" 2>/dev/null || true
+incus snapshot create "$src" "$snap"
+trap 'incus snapshot delete "$src" "$snap" 2>/dev/null || true' EXIT
+incus copy "$src/$snap" "$tmp"
+for dev in $(incus config device list "$tmp"); do incus config device remove "$tmp" "$dev" >/dev/null; done
+empty=$(mktemp)
+incus file push --mode=0444 "$empty" "$tmp/etc/machine-id"
+rm -f "$empty"
+incus file delete "$tmp/tmp/.locki-branch-named" 2>/dev/null || true
+incus config set "$tmp" __KEYS__
+incus delete --force "$tpl" 2>/dev/null || true
+incus rename "$tmp" "$tpl"
+"""
+
+
+# Runs the entry command in the mise environment of the worktree (the sandbox tools and the
+# repo's pins), so a harness and everything it runs inherit it: bash loads it through BASH_ENV,
+# see container-setup.sh; without bash, `mise env` gives the same environment once.
+_ENTER = r"""if command -v bash >/dev/null 2>&1; then exec bash -c 'exec "$@"' locki "$@"; fi
+eval "$(mise env 2>/dev/null)"
+exec "$@"
+"""
 
 
 class ContainerService:
@@ -34,6 +99,9 @@ class ContainerService:
         return {
             # agy self-updates in the background; mise owns its install path here
             "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
+            # every non-interactive bash (agents' command shells) loads the repo's mise
+            # environment, see container-setup.sh
+            "BASH_ENV": "/etc/profile.d/locki-mise.sh",
             "BUN_INSTALL_CACHE_DIR": "/var/cache/locki/bun",
             "BUNDLE_PATH": "/var/cache/locki/bundle",
             "CABAL_DIR": "/var/cache/locki/cabal",
@@ -44,7 +112,8 @@ class ContainerService:
             "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/etc/copilot",
             "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
             "COURSIER_CACHE": "/var/cache/locki/coursier",
-            "DENO_DIR": "/var/cache/locki/deno",
+            # the VM keeps Claude Code up to date (services/tools.py); its install is read-only
+            "DISABLE_AUTOUPDATER": "1",
             "GOCACHE": "/var/cache/locki/go/build",
             "GOMODCACHE": "/var/cache/locki/go/mod",
             "GRADLE_USER_HOME": "/var/cache/locki/gradle",
@@ -56,21 +125,24 @@ class ContainerService:
             "LOCKI_SCOPED_CACHE": f"{SCOPED_CACHE}/{worktree.wt_id}",
             "LOCKI_WORKTREES_HOME": str(WORKTREES),
             "MAVEN_OPTS": "-Dmaven.repo.local=/var/cache/locki/maven",
-            "MISE_CACHE_DIR": "/var/cache/locki/mise",
-            "MISE_DATA_DIR": "/usr/share/mise",
+            # no shims: every bash loads the mise environment instead, see container-setup.sh
+            "MISE_ACTIVATE_SHIMS": "false",
             "MISE_GLOBAL_CONFIG_FILE": "/opt/locki/mise.toml",
-            "MISE_INSTALL_PATH": "/usr/local/bin/mise",
             "MISE_NODE_VERIFY": "false",
-            # Provenance stays on, but an unreachable/rate-limited api.github.com must not be
-            # fatal -- that is exactly when the lockfile fallback runs, and checksums still hold.
+            # Provenance stays on, but an unreachable/rate-limited api.github.com must not
+            # fail installs of repo-pinned tools -- checksums still hold.
             "MISE_PROVENANCE_API_FAILURES_FATAL": "false",
+            # Locki's sandbox tools, at the exact versions the VM installed (services/tools.py)
+            "MISE_SYSTEM_CONFIG_FILE": TOOLS_CONFIG,
             "MISE_TRUSTED_CONFIG_PATHS": "/",
             "MIX_HOME": "/var/cache/locki/mix",
             "NIMBLE_DIR": "/var/cache/locki/nimble",
             "npm_config_cache": "/var/cache/locki/npm",
+            # node comes read-only from the VM (services/tools.py); `npm i -g` lands here instead
+            "npm_config_prefix": "/usr/local",
             "NUGET_PACKAGES": "/var/cache/locki/nuget",
-            "PATH": "/opt/locki/bin/high:/root/.local/bin:/usr/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/locki/bin/low",
-            "PIP_CACHE_DIR": "/var/cache/locki/pip",
+            # the mise environment adds the tools (and the repo's pins) on entry, see exec_interactive
+            "PATH": f"/opt/locki/bin/high:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{TOOLS_BIN}:/opt/locki/bin/low",
             "POETRY_VIRTUALENVS_PATH": f"{SCOPED_CACHE}/{worktree.wt_id}/poetry-venvs",
             "POETRY_VIRTUALENVS_IN_PROJECT": "false",
             "PNPM_HOME": "/usr/share/pnpm",
@@ -79,8 +151,9 @@ class ContainerService:
             "REBAR_CACHE_DIR": "/var/cache/locki/rebar3",
             "STACK_ROOT": "/var/cache/locki/stack",
             "TF_PLUGIN_CACHE_DIR": "/var/cache/locki/terraform",
-            "UV_CACHE_DIR": "/var/cache/locki/uv",
             "VCPKG_DEFAULT_BINARY_CACHE": "/var/cache/locki/vcpkg",
+            # tools following XDG (mise, uv, pip, deno, ...) need no own variable: caches land in
+            # /var/cache/locki/<tool>, mise installs in /usr/share/mise
             "XDG_DATA_HOME": "/usr/share",
             "XDG_CACHE_HOME": "/var/cache/locki",
             "XDG_BIN_HOME": "/usr/local/bin",
@@ -173,7 +246,9 @@ class ContainerService:
                 check=False,
                 print_success=False,
             )
-            if worktree.wt_id not in result.stdout.decode():
+            if worktree.wt_id not in result.stdout.decode() and (template := self.template(worktree.repo)):
+                self._create_from_template(worktree, template)
+            elif worktree.wt_id not in result.stdout.decode():
                 incus_image = config.get_incus_image(worktree.repo)
 
                 local_path = worktree.repo / incus_image
@@ -202,13 +277,6 @@ class ContainerService:
                     .read_bytes()
                     .replace(b"__INTERCEPTED_HOSTS__", " ".join(INTERCEPTED_HOSTS).encode())
                     .replace(b"__AGENTS_MD_B64__", base64.b64encode((PACKAGE_DATA / "AGENTS.md").read_bytes()))
-                    .replace(b"__MISE_LOCK_B64__", base64.b64encode((PACKAGE_DATA / "mise.lock").read_bytes()))
-                    .replace(
-                        b"__LIBATOMIC_B64__",
-                        base64.b64encode((PACKAGE_DATA / "libatomic.so.1").read_bytes())
-                        if (PACKAGE_DATA / "libatomic.so.1").is_file()
-                        else b"",
-                    )
                 )
                 env_flags = [flag for k, v in self.env(worktree).items() for flag in ("--env", f"{k}={v}")]
                 vm.run(
@@ -236,7 +304,7 @@ class ContainerService:
         return {
             name.strip(): status.strip().lower()
             for name, sep, status in (line.partition(",") for line in result.stdout.splitlines())
-            if sep
+            if sep and not name.strip().startswith(TEMPLATE_PREFIX)  # see `locki template get`
         }
 
     def stop(self, *wt_ids: str) -> set[str]:
@@ -260,6 +328,99 @@ class ContainerService:
             return set(wt_ids)
         return set(result.stdout.decode().split()) & set(wt_ids)
 
+    def _create_from_template(self, worktree: WorktreeInfo, template: TemplateInfo) -> None:
+        """Create the sandbox container as a copy of its repo's template.  The template
+        was fully set up already, so container-setup.sh (not idempotent) is skipped;
+        unsetting `volatile.apply_template` keeps the image's copy-time templates from
+        regenerating files the setup customized (e.g. /etc/hosts)."""
+        if template.version != VERSION:
+            click.echo(
+                f"{INFO} This repo's sandbox template was taken with Locki {template.version} (now {VERSION});"
+                f" re-run {click.style('locki template set', fg='green')} to pick up sandbox setup changes.",
+                err=True,
+            )
+        wt_id_q = shlex.quote(worktree.wt_id)
+        tpl_q = shlex.quote(template.name)
+        wt_path_q = shlex.quote(str(worktree.path))
+        with file_lock(f"template-{template.name}", "Waiting for the sandbox template to update"):
+            vm.run(
+                [
+                    "sh",
+                    "-c",
+                    " && ".join(
+                        [
+                            f"incus copy {tpl_q} {wt_id_q}",
+                            f"{{ incus config unset {wt_id_q} volatile.apply_template 2>/dev/null || true; }}",
+                            f"incus config device add {wt_id_q} {WORKTREE_DEVICE} disk"
+                            f" source={wt_path_q} path={wt_path_q}",
+                            f"incus start {wt_id_q}",
+                        ]
+                    ),
+                ],
+                f"Starting container from template of {click.style(template.source, fg='green')}",
+            )
+
+    def template(self, repo: pathlib.Path) -> TemplateInfo | None:
+        """The template new sandboxes of *repo* are copied from, if one is set."""
+        if vm.status() is None:
+            return None  # no VM, so no templates
+        name = template_name(repo)
+        result = vm.run(
+            ["incus", "query", f"/1.0/instances/{name}"],
+            "Checking for sandbox template",
+            check=False,
+            quiet=True,
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            config = json.loads(result.stdout).get("config") or {}
+        except json.JSONDecodeError:
+            return None
+        return TemplateInfo(
+            name=name,
+            **{
+                f.name: config.get(_TEMPLATE_KEY + f.name, "")
+                for f in dataclasses.fields(TemplateInfo)
+                if f.name != "name"
+            },
+        )
+
+    def set_template(self, worktree: WorktreeInfo) -> TemplateInfo:
+        """Make a copy of *worktree*'s container the template for its repo's new sandboxes,
+        replacing any previous one."""
+        name = template_name(worktree.repo)
+        info = TemplateInfo(
+            name=name,
+            repo=str(worktree.repo),
+            source=worktree.wt_id,
+            branch=worktree.branch,
+            created=datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+            version=VERSION,
+        )
+        keys = " ".join(shlex.quote(f"{_TEMPLATE_KEY}{k}={v}") for k, v in info.as_dict().items() if k != "name")
+        script = (
+            _TEMPLATE_SET_SCRIPT.replace("__SRC__", shlex.quote(worktree.wt_id))
+            .replace("__TPL__", shlex.quote(name))
+            .replace("__KEYS__", keys)
+        )
+        with file_lock(f"template-{name}", "Waiting for another sandbox template update"):
+            result = vm.run(["sh", "-c", script], "Saving sandbox template", check=False)
+        if result.returncode == 3:
+            fail(f"Sandbox {worktree.wt_id} has no container yet. Enter it first, e.g. `locki x -m {worktree.wt_id}`.")
+        if result.returncode != 0:
+            fail(f"Saving sandbox template failed: {result.stderr.decode(errors='replace').strip()}")
+        return info
+
+    def unset_template(self, repo: pathlib.Path) -> TemplateInfo | None:
+        """Delete *repo*'s template; returns what was removed (None if nothing was set)."""
+        info = self.template(repo)
+        if info is None:
+            return None
+        with file_lock(f"template-{info.name}", "Waiting for another sandbox template update"):
+            vm.run(["incus", "delete", "--force", info.name], "Removing sandbox template")
+        return info
+
     def remove(self, *wt_ids: str) -> None:
         """Delete container(s) and their sandbox-scoped cache folders in one VM roundtrip."""
         if not wt_ids:
@@ -273,6 +434,7 @@ class ContainerService:
 
     def exec_interactive(self, worktree: WorktreeInfo, command: list[str]) -> subprocess.CompletedProcess:
         """Run *command* in the sandbox container with inherited stdio."""
+        env = self.env(worktree)
         return vm.shell(
             [
                 "bash",
@@ -285,9 +447,13 @@ class ContainerService:
                         shlex.quote(worktree.wt_id),
                         "--cwd",
                         shlex.quote(str(worktree.path)),
-                        *(f"--env={k}={v}" for k, v in self.env(worktree).items()),
-                        *(f'--env={env}="${env}"' for env in self.forwarded_env),
+                        *(f"--env={k}={v}" for k, v in env.items()),
+                        *(f'--env={name}="${name}"' for name in self.forwarded_env),
                         "--",
+                        "sh",
+                        "-c",
+                        shlex.quote(_ENTER),
+                        "locki",
                         *(shlex.quote(a) for a in command),
                     ]
                 ),

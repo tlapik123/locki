@@ -110,7 +110,7 @@ Each sandbox gets its own [worktree](https://git-scm.com/docs/git-worktree) (a f
 - Editors like VSCode show worktrees in the sidebar, useful as a quick UI for reviewing and modifying changes.\
   *(⚠️ VSCode 1.115.0+ requires setting `"git.detectWorktrees": true` for this to work.)*
 
-- Working on two repos at once? `cd` into your sandbox's primary repo and run `locki include --repo ../other-repo` to graft the other repo into the current sandbox at `.locki/include/<repo-name>-locki-<sandbox-id>/`. Or from the other repo: `locki include --this -m <sandbox-id>`.
+- Working on two repos at once? `cd` into your sandbox's primary repo and run `locki include --repo ../other-repo` to graft the other repo into the current sandbox at `.locki/include/<repo-name>-locki-<sandbox-id>/`. Or from the other repo: `locki include --this -m <sandbox-id>`. A repo can be included more than once, the sandbox's own repo included -- extra copies get a numbered name and branch (`<repo-name>-2-locki-<sandbox-id>/` on `untitled-2#locki-<sandbox-id>`). Since `locki include --this` inside a sandbox folder picks that sandbox, running it there adds another worktree of the sandbox's own repo -- agents are allowed to do this themselves.
 
 - While `locki ai` opens a coding agent, `locki exec` (or short `locki x`) is the low-level version which can run any command. Pass a command to run in a sandbox, use `--match`/`-m` to select by branch substring or sandbox id: `locki exec -m big-refactor -- pytest`.
 
@@ -118,11 +118,15 @@ Each sandbox gets its own [worktree](https://git-scm.com/docs/git-worktree) (a f
 
 - Ask your agent to forward ports, or use `locki port-forward` for more control.
 
+- The AI harnesses ship new releases often, and new models usually need the latest one. Locki upgrades them before entering a sandbox, at most hourly; run `locki vm update-tools` to get a release right away. Those upgrades call the GitHub API, which allows only 60 anonymous requests per hour, so Locki passes it your `GITHUB_TOKEN` / `GH_TOKEN`, or else `gh auth token`. The token only reaches the VM's install run, never a sandbox. If GitHub can't be reached (or rejects the token), a tool that isn't installed yet comes from versions pinned in Locki (`src/locki/data/tools.lock`, refreshed with `mise run lock-tools`) and updates on a later sync. A [fine-grained token](https://github.com/settings/personal-access-tokens/new) with no permissions is enough and is the safest choice, since `gh auth token` has your full access.
+
 - Locki sandboxes provide [Mise](https://mise.jdx.dev) for tool version management -- replacing `nvm`, `rbenv`, `brew` etc. with a single tool. Adding `mise.toml` to your repo with tool versions and task definitions will help agents and humans alike: ask your agent to do it!
 
 - Want to use custom AI configuration in the VM -- instructions, skills, MCP servers, ...? Sandboxes share a home folder accessible at `~/.local/share/locki/home` on host (or `$XDG_DATA_HOME/locki/home`). For example, you can edit `~/.local/share/locki/home/.claude/CLAUDE.md` for sandbox-specific instructions.
 
 - Something is broken? Try `locki vm delete` -- it will preserve your worktrees and settings, but the VM and sandboxes will be recreated from scratch on next run.
+
+- Project needs heavy OS-level setup (system packages, services, pre-pulled Docker images, a local cluster, ...)? Do it once in a sandbox, then run `locki template set` there: new sandboxes of the same repo start as copies of that sandbox's container (a near-instant btrfs snapshot) instead of the fresh image. The template is a snapshot taken at `set` time -- later changes to the source sandbox aren't picked up until you re-run `set`, and removing the source sandbox doesn't affect it. Only the container is copied: worktree contents and per-sandbox caches (`node_modules`, `.venv`) are not. `locki template get` shows the current template, `locki template unset` goes back to the image. Templates live in the VM, so `locki vm delete` removes them too.
 
 - Sandboxes run on Fedora 44. Want a different OS? Create a `locki.toml` file in repo root referencing either [an available OS image](https://images.linuxcontainers.org/), or a local Incus image archive by path. For the local archive format, see the [Incus image format documentation](https://linuxcontainers.org/incus/docs/main/reference/image_format/). Example:
 
@@ -169,7 +173,7 @@ Locki may not provide perfect security, however it is certainly much better than
 - **A host daemon** provides the `git`/`gh`/port-forward command bridge (over an SSH forced command bound to loopback) and idles containers and the VM back down when unused. Idle containers are only *stopped*, never deleted — reclaim disk explicitly with `locki rm --merged` (drop clean sandboxes whose branch is merged) and `locki vm prune` (drop caches of removed sandboxes).
 - **Shared caches across all sandboxes** keep repeat work fast: a pull-through container-registry cache (nginx), a shared BuildKit daemon (Docker layers cached across sandboxes), package caches for [Mise](https://mise.jdx.dev), cargo, npm/pnpm, pip/uv, go, and more, plus GitHub-release and k3s-installer caching.
 - **btrfs with [bees](https://github.com/Zygo/bees) deduplication** for the container pool, so many similar sandboxes cost little disk. `node_modules` and `.venv` are redirected to the shared cache via a per-sandbox symlink (so opening a worktree on the host shows a symlink, not a real directory).
-- **[Mise](https://mise.jdx.dev)** provides on-demand, version-managed tools inside each sandbox.
+- **Sandbox tools** (the AI harnesses, `node`, `python`, `uv`, `jq`, `kubectl`, ... and [Mise](https://mise.jdx.dev) itself) are installed once in the VM by Mise and mounted read-only into every sandbox, so a new sandbox starts with all of them and no sandbox can tamper with them. Before entering a sandbox, Locki checks for new releases at most hourly; `locki vm update-tools` upgrades right away. Inside a sandbox, there are no shims: every shell loads the Mise environment of its directory, so a repo's own `mise.toml` pins come first, reusing the VM's copy when the version matches, and installing on first use when it doesn't.
 
 &nbsp;
 

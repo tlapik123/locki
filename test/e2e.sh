@@ -348,7 +348,7 @@ echo "  hot start: ${hot_start}s"
 
 # ── uv venv redirect ─────────────────────────────────────────────────────────
 # The uv shim must place the project venv on the shared btrfs cache (hardlinks
-# from UV_CACHE_DIR work there) and leave only a symlink in the worktree.
+# from the uv cache work there) and leave only a symlink in the worktree.
 
 echo
 echo "Testing uv venv redirect to shared cache..."
@@ -357,41 +357,75 @@ assert_ok "uv init + sync works" locki x -m "$RELEASE" bash -c 'uv init -q --nam
 assert_output "uv .venv is a symlink into the sandbox-scoped cache" "/var/cache/locki/scoped/$RELEASE/uv-venvs" \
     locki x -m "$RELEASE" readlink .venv
 
-# ── python shims ─────────────────────────────────────────────────────────────
-# Base fedora image ships no python3 (dnf5 dropped the dependency); the shims
-# must auto-install it via mise so e.g. python3-based Claude Code hooks work.
+# ── sandbox tools from the VM ────────────────────────────────────────────────
+# AI harnesses and CLIs are installed once in the VM and mounted read-only into every
+# sandbox (services/tools.py). Base fedora ships no python3 (dnf5 dropped it), so python
+# must come from there too, e.g. for python3-based Claude Code hooks.
 
 echo
-echo "Testing python/pip shims..."
+echo "Testing sandbox tools from the VM..."
 
-assert_output "python3 shim auto-installs and runs" "py-ok" locki x -m "$RELEASE" python3 -c 'print("py-ok")'
+assert_output "python3 from the VM runs" "py-ok" locki x -m "$RELEASE" python3 -c 'print("py-ok")'
 assert_ok "python resolves" locki x -m "$RELEASE" python --version
 assert_ok "pip3 resolves" locki x -m "$RELEASE" pip3 --version
 assert_ok "pip resolves" locki x -m "$RELEASE" pip --version
-
-# ── mise + node preinstalled ─────────────────────────────────────────────────
-# Container setup installs mise and node eagerly (no mise/node/npx shims left to lazy-install them).
-
-assert_ok "mise + node preinstalled by container setup" locki x -m "$RELEASE" sh -c 'locki-command-real mise && locki-command-real node'
-
-# ── tool installs without the GitHub API ─────────────────────────────────────
-# /opt/locki/mise.lock pins each shim tool's version, URL and checksum, so installs
-# never call api.github.com — whose 60/hr anonymous limit every sandbox shares. When
-# that broke, the docker shim silently stopped pinning local base images.
-
-echo
-echo "Testing tool installs with the GitHub API unreachable..."
-
-NOAPI=$(new_sandbox_id)
-locki x -m "$NOAPI" sh -c 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
-assert_ok     "lockfile shipped into the sandbox" locki x -m "$NOAPI" test -s /opt/locki/mise.lock
+assert_ok "mise + node available" locki x -m "$RELEASE" sh -c 'locki-command-real mise && locki-command-real node'
+assert_ok "every tool command resolves" locki x -m "$RELEASE" sh -c \
+    'for c in claude codex pi opencode copilot antigravity agy agent-browser corepack pnpm pnpx pnx yarn jq yq rg fd k9s kubectl uv uvx poetry bun npm npx; do
+       command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
+     done'
+# its launcher chmods the bundled binary on first run, which the read-only mount refuses
+assert_ok "agent-browser's native binary runs from the read-only tools" locki x -m "$RELEASE" sh -c \
+    '"$(locki-command-real agent-browser)" --version'
+assert_output "codex comes from the VM tools" "/usr/local/share/mise/" locki x -m "$RELEASE" sh -c 'command -v codex'
+assert_fail "tools mount is read-only" locki x -m "$RELEASE" touch /usr/local/share/mise/pwned
+# A repo pin matching a VM install uses it in place (mise checks its system installs by itself),
+# and the repo's mise environment puts it first on PATH in any bash, without a shim.
+assert_ok "repo pin reuses the VM install, first on PATH" locki x -m "$RELEASE" bash -c '
+    v=$(jq --version | cut -d- -f2) && mkdir -p /tmp/pin && cd /tmp/pin &&
+    printf "[tools]\njq = \"%s\"\n" "$v" > mise.toml && mise install -q &&
+    ! test -e /usr/share/mise/installs/jq &&
+    bash -c "cd /tmp/pin && command -v jq" | grep -q "^/usr/local/share/mise/installs/jq/"'
+assert_ok "cd into a pinned dir within one command switches the environment" locki x -m "$RELEASE" bash -c \
+    'cd / && cd /tmp/pin && command -v jq | grep -q "^/usr/local/share/mise/installs/jq/"'
+# No shims: a pinned version installed nowhere installs when first run (command-not-found),
+# rather than a different version of it being found further down PATH
+assert_ok "a pin installed nowhere installs on first use" locki x -m "$RELEASE" bash -c '
+    mkdir -p /tmp/pin2 && cd /tmp/pin2 && printf "[tools]\njq = \"1.7.1\"\n" > mise.toml &&
+    bash -c "cd /tmp/pin2 && jq --version" | grep -qx "jq-1.7.1"'
+assert_ok "Locki shims stay first on PATH in a pinned dir" locki x -m "$RELEASE" bash -c \
+    'cd /tmp/pin2 && [ "${PATH%%:*}" = /opt/locki/bin/high ]'
+assert_ok "the entry command runs in the mise environment" locki x -m "$RELEASE" sh -c \
+    'command -v claude | grep -q "^/usr/local/share/mise/installs/"'
+assert_ok "npm i -g writes outside the read-only tools" locki x -m "$RELEASE" sh -c \
+    'npm i -g -s cowsay && test -x /usr/local/bin/cowsay'
+assert_ok "corepack pnpm runs outside the read-only tools" locki x -m "$RELEASE" pnpm --version
+assert_ok "corepack yarn runs" locki x -m "$RELEASE" yarn --version
 # Verification must stay on: disabling it sandbox-wide breaks any repo whose own
 # lockfile records provenance ("Lockfile requires ... but no verification was used").
 assert_output "provenance verification stays enabled" "true" \
-    locki x -m "$NOAPI" mise settings get github_attestations
-assert_output "aqua-backend tool installs (jq)" "jq-1" locki x -m "$NOAPI" jq --version
-assert_output "github-backend tool installs (dockerfile-json)" "alpine:3.20" \
+    locki x -m "$RELEASE" mise settings get github_attestations
+
+# ── tools work without the GitHub API in the sandbox ─────────────────────────
+# Sandboxes never resolve or download Locki's tools themselves. When they did, the shared
+# 60/hr anonymous limit broke the docker shim's pinning of local base images.
+
+echo
+echo "Testing sandbox tools with the GitHub API unreachable..."
+
+NOAPI=$(new_sandbox_id)
+locki x -m "$NOAPI" sh -c 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
+assert_output "jq runs" "jq-1" locki x -m "$NOAPI" jq --version
+assert_output "dockerfile-json runs" "alpine:3.20" \
     locki x -m "$NOAPI" sh -c 'printf "FROM alpine:3.20\n" >/tmp/D; dockerfile-json -quiet /tmp/D'
+
+# ── tools sync skips when nothing is due ─────────────────────────────────────
+
+echo
+echo "Testing sandbox tools sync..."
+
+assert_fail "no tools sync on a warm entry" sh -c "locki x -m '$RELEASE' true 2>&1 | grep -q 'sandbox tools'"
+assert_ok "forced upgrade succeeds" locki vm update-tools
 
 # ── cache symlinks git-ignored per-worktree ──────────────────────────────────
 # "node_modules/" style .gitignore rules don't match symlinks; the per-worktree
@@ -1054,8 +1088,20 @@ assert_ok    "include folder exists"              test -d "$INCLUDE_PATH"
 assert_ok    "include .git pointer exists"        test -f "$INCLUDE_PATH/.git"
 assert_output "include branch named #locki-<id>"  "untitled#locki-$AUTH" git -C "$INCLUDE_PATH" branch --show-current
 
-# Second include call for same repo should fail (collision).
-assert_fail  "duplicate include rejected"         locki include -m "$AUTH" --repo "$REPO2"
+# Including the same repo again adds a numbered second worktree.
+INCLUDE2_PATH="$WORKTREE/.locki/include/$(basename "$REPO2")-2-locki-$AUTH"
+assert_ok    "same repo can be included twice"    locki include -m "$AUTH" --repo "$REPO2"
+assert_output "second include branch is numbered" "untitled-2#locki-$AUTH" git -C "$INCLUDE2_PATH" branch --show-current
+
+# The sandbox's own repo can be included too, also by the agent via the bridge.
+SELF_INCLUDE_PATH="$WORKTREE/.locki/include/$(basename "$REPO")-2-locki-$AUTH"
+assert_output "agent includes sandbox's own repo" "\"path\": \"$SELF_INCLUDE_PATH\"" \
+    locki x -m "$AUTH" locki include --this --json
+assert_output "own-repo include branch is numbered" "untitled-2#locki-$AUTH" git -C "$SELF_INCLUDE_PATH" branch --show-current
+assert_output "git works inside own-repo include" "untitled-2#locki-$AUTH" \
+    locki x -m "$AUTH" bash -c "cd $SELF_INCLUDE_PATH && git branch --show-current"
+assert_fail  "agent cannot include into other sandboxes" locki x -m "$AUTH" locki include --this -m "$LOGIN"
+assert_fail  "agent cannot include arbitrary repos" locki x -m "$AUTH" locki include --repo "$REPO2"
 
 # Git commands inside the include go through the command bridge.
 assert_output "git status works inside include"   "nothing to commit" \
@@ -1071,6 +1117,31 @@ ORIGINAL_DOTGIT=$(cat "$INCLUDE_PATH/.git")
 echo "gitdir: /tmp/evil" > "$INCLUDE_PATH/.git"
 assert_ok   "tampered .git is auto-repaired" locki x -m "$AUTH" bash -c "cd $INCLUDE_PATH && git status"
 assert_output ".git restored from metadata" "$ORIGINAL_DOTGIT" cat "$INCLUDE_PATH/.git"
+
+# ── sandbox templates ────────────────────────────────────────────────────────
+
+echo
+echo "Testing sandbox templates..."
+
+assert_output "no template by default" "null" locki template get --json
+locki x -m "$LOGIN" bash -c 'echo from-template > /etc/template-marker; echo 1.2.3.4 template-test.invalid >> /etc/hosts'
+assert_ok     "locki template set" locki template set -m "$LOGIN"
+assert_output "template get reports source sandbox" "\"source\": \"$LOGIN\"" locki template get --json
+assert_fail   "template is hidden from vm status" bash -c "locki vm status | grep -q locki-template-"
+TPL_SB=$(new_sandbox_id)
+assert_output "new sandbox starts from template" "from-template" locki x -m "$TPL_SB" cat /etc/template-marker
+assert_output "template copy keeps setup's /etc/hosts" "template-test.invalid" locki x -m "$TPL_SB" cat /etc/hosts
+assert_output "template copy mounts its own worktree" "$(worktree_of "$TPL_SB")" locki x -m "$TPL_SB" pwd
+assert_fail   "template copy gets a fresh machine-id" bash -c \
+    "[ \"\$(locki x -m '$TPL_SB' cat /etc/machine-id)\" = \"\$(locki x -m '$LOGIN' cat /etc/machine-id)\" ]"
+assert_ok     "template copy has networking" locki x -m "$TPL_SB" curl -fsS -o /dev/null https://pypi.org/simple/
+assert_output "template survives removing its source" "\"source\": \"$LOGIN\"" \
+    bash -c "locki remove -m '$TPL_SB' --force >/dev/null 2>&1; locki template get --json"
+assert_ok     "locki template unset" locki template unset
+assert_output "template is gone after unset" "null" locki template get --json
+PLAIN_SB=$(new_sandbox_id)
+assert_fail   "new sandbox after unset starts from image" locki x -m "$PLAIN_SB" test -f /etc/template-marker
+locki remove -m "$PLAIN_SB" --force >/dev/null 2>&1 || true
 
 # ── branch verification on non-conforming worktree ──────────────────────────
 
@@ -1099,19 +1170,6 @@ assert_ok   "guard lets the rename command through" locki x -m "$LOGIN" sh -c "e
 locki x -m "$LOGIN" git branch "guarded#locki-$LOGIN" --move
 assert_ok   "guard passes after rename" locki x -m "$LOGIN" sh -c "echo '{}' | $GUARD"
 
-# ── Claude Code node warm-up ─────────────────────────────────────────────────
-# Claude Code plugins run their hooks with `node` under ~5s per-hook timeouts, and the
-# RPM claude ships no node — the shim must install node before exec'ing claude, or the
-# first session's hooks (including one-shot SessionStart) get killed mid-install.
-
-echo
-echo "Testing claude shim node warm-up..."
-
-# Fake the real binary ahead of the shim's resolution so no actual claude install/run happens.
-locki x -m "$LOGIN" sh -c 'printf "#!/bin/sh\necho claude-ok\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'
-assert_output "claude shim installs node, then execs" "claude-ok" locki x -m "$LOGIN" timeout 300 claude
-assert_ok "node is ready before claude starts" locki x -m "$LOGIN" locki-command-real node
-locki x -m "$LOGIN" rm -f /usr/local/bin/claude
 
 # ── Antigravity CLI (agy) ────────────────────────────────────────────────────
 # agy reads neither a system-wide settings file nor a system-wide instructions
@@ -1160,6 +1218,7 @@ assert_fail "removed worktree dir is gone" test -d "$WORKTREE"
 assert_fail "included worktree dir is gone" test -d "$INCLUDE_PATH"
 # repo2 should no longer list the worktree
 assert_fail "include worktree removed from source repo" bash -c "git -C '$REPO2' worktree list | grep -q '$INCLUDE_PATH'"
+assert_fail "own-repo include removed from repo" bash -c "git -C '$REPO' worktree list | grep -q '$SELF_INCLUDE_PATH'"
 
 # ── registry cache hits across sandboxes ─────────────────────────────────────
 
@@ -1246,7 +1305,7 @@ fi
 
 # ── nested auto-install must not deadlock (reentrant lock) ───────────────────
 # Regression: a shim's install command can invoke another shim that auto-installs
-# (e.g. `mise use` -> install mise), re-entering locki-auto-install. flock is not
+# (e.g. pnpm), re-entering locki-auto-install. flock is not
 # reentrant, so without an outermost-only lock the nested call deadlocks on the
 # lock its own ancestor holds — freezing installs in *every* sandbox (shared cache).
 echo

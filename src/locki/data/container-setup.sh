@@ -20,31 +20,39 @@ projects."$LOCKI_WORKTREES_HOME".trust_level = "trusted"
 EOF
 
 # MARK: libatomic
-## Node 25+ needs it, distros don't ship it, Locki vendors it
+## Node 25+ needs it and distros rarely ship it; the VM provides one with the sandbox tools
 
 if ! ldconfig -p 2>/dev/null | grep -q libatomic; then
-  set +x
-  libatomic_b64='__LIBATOMIC_B64__'
-  set -x
-  if [ -n "$libatomic_b64" ]; then
-    mkdir -p /usr/local/lib
-    echo "$libatomic_b64" | base64 -d > /usr/local/lib/libatomic.so.1
-    mkdir -p /etc/ld.so.conf.d
-    echo /usr/local/lib > /etc/ld.so.conf.d/locki.conf
-    ldconfig 2>/dev/null || true
-  fi
+  mkdir -p /etc/ld.so.conf.d
+  echo /usr/local/share/mise/locki/lib > /etc/ld.so.conf.d/locki.conf
+  ldconfig 2>/dev/null || true
 fi
 
-# MARK: mise lockfile
-## Pinned resolutions for every tool the shims install. Only locki-mise-install reads it,
-## and only after a normal install fails — typically because api.github.com's 60/hr
-## anonymous limit, shared by every sandbox behind the VM's IP, is exhausted. Regenerate
-## with `mise run lock-tools`; versions are as old as the last regeneration.
+# MARK: Sandbox tools
+## Nothing to install: AI harnesses, CLIs, node and mise itself come from the VM, mounted read-only
+## at /usr/local/share/mise (mise's default system data dir) and listed at their exact versions in
+## the mise system config (MISE_SYSTEM_CONFIG_FILE, see services/tools.py). A repo's pins resolve
+## to those installs when they match, and install into the sandbox (/usr/share/mise) when they don't.
 
-mkdir -p /opt/locki
-set +x
-echo '__MISE_LOCK_B64__' | base64 -d > /opt/locki/mise.lock
-set -x
+## No shims: every bash loads the mise environment of its working directory, agents' command shells
+## through BASH_ENV (non-interactive), login and interactive ones through profile.d, and the entry
+## command runs under one too (ContainerService.exec_interactive). That puts the repo's pins, then
+## Locki's tools, on PATH, behind /opt/locki/bin/high (the `_.path` of the system config), and
+## `mise activate` follows `cd` and config changes. A pinned version missing everywhere installs
+## on first use, through mise's command-not-found handler (not_found_auto_install).
+## /etc/profile of some distros resets PATH: a login shell restores the Locki entries first.
+## Locki's own bash shims skip all this: they only look up the real binary.
+cat > /etc/profile.d/locki-mise.sh << 'EOF'
+case "$0" in /opt/locki/bin/*) ;; *)
+  case ":$PATH:" in *:/opt/locki/bin/high:*) ;; *)
+    PATH="/opt/locki/bin/high:/root/.local/bin:$PATH:/usr/local/share/mise/locki/bin:/opt/locki/bin/low" ;;
+  esac
+  if [ -n "${BASH_VERSION:-}" ] && [ -z "${__LOCKI_MISE_ACTIVE:-}" ] && command -v mise >/dev/null 2>&1; then
+    __LOCKI_MISE_ACTIVE=1
+    eval "$(mise activate bash)"
+  fi
+esac
+EOF
 
 # MARK: High-priority shims
 
@@ -60,7 +68,7 @@ mkdir -p "$(dirname "$log")" /var/cache/locki
 printf '\033[1;35mᚠ\033[0m Installing %s...\n' "$name" >&2
 # Always log; mirror to the terminal too when stderr is a TTY (user-run), stay silent for agents (no TTY).
 [ -t 2 ] && tty_out=/dev/stderr || tty_out=/dev/null
-# flock is not reentrant: an install command may invoke another shim that auto-installs (e.g. mise),
+# flock is not reentrant: an install command may invoke another shim that auto-installs (e.g. pnpm),
 # which would deadlock on the lock its own ancestor holds. Take the lock only at the outermost call.
 [ -n "${LOCKI_INSTALLING:-}" ] || set -- flock -o /var/cache/locki/.install.lock env LOCKI_INSTALLING=1 "$@"
 { "$@" 2>&1; echo "$?" > "$log.rc"; } | tee -a "$log" > "$tty_out"
@@ -72,22 +80,6 @@ else
   [ -t 2 ] || tail -n 30 "$log" >&2
   exit 1
 fi
-EOF
-
-## locki-mise-install: install a package globally via mise (shim-safe env)
-cat > /opt/locki/bin/high/locki-mise-install << 'EOF'
-#!/bin/sh
-# MISE_LOCKFILE=false so installs resolve current versions and ignore /opt/locki/mise.lock.
-# Scoped to this script: setting it in the container env would make mise ignore the
-# lockfiles of the repos worked on in the sandbox.
-export MISE_AUTO_INSTALL=false MISE_NO_HOOKS=true MISE_LOCKFILE=false
-mise use -g "$1" && mise install "$1" && exit 0
-# Version resolution goes through api.github.com, so it dies once that anonymous rate
-# limit is spent. Fall back to the shipped lockfile: MISE_LOCKED demands its pre-resolved
-# URLs, needing no API at all, at the cost of a possibly stale version.
-printf '\033[1;33mᛚ\033[0m Retrying %s from Locki'"'"'s pinned lockfile\n' "$1" >&2
-export MISE_LOCKFILE=true MISE_LOCKED=true
-mise use -g "$1" && mise install "$1"
 EOF
 
 ## locki-fetch <url> <dest>: download with curl -> wget -> python3 fallback
@@ -102,20 +94,11 @@ urlretrieve(sys.argv[1], sys.argv[2])' "$1" "$2"
 else echo "[Locki] Error: no HTTP client found (need curl, wget, or python3)" >&2; exit 1; fi
 EOF
 
-## locki-command-real: resolve binary outside ALL /opt/locki/bin/ shim folders
-## MISE_LOCKFILE=false to match locki-mise-install: installs resolve current versions, so a
-## lockfile lagging upstream would pin `which` to a version that was never installed.
+## locki-command-real: the binary a Locki shim stands in for. The mise version first (a repo pin,
+## else Locki's tool), else PATH without Locki's own shims (/opt/locki/bin/*).
 cat > /opt/locki/bin/high/locki-command-real << 'EOF'
 #!/bin/sh
-_mise="${MISE_INSTALL_PATH:-/usr/local/bin/mise}"
-PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -e '^/opt/locki/bin/' -e '/mise/shims' | paste -sd:) command -v "$1" || MISE_LOCKFILE=false "$_mise" which "$1" 2>/dev/null || exit 1
-EOF
-
-## locki-command-real-or-autoinstalled: resolve binary outside /opt/locki/bin/high (low shims still reachable)
-cat > /opt/locki/bin/high/locki-command-real-or-autoinstalled << 'EOF'
-#!/bin/sh
-_mise="${MISE_INSTALL_PATH:-/usr/local/bin/mise}"
-MISE_LOCKFILE=false "$_mise" which "$1" 2>/dev/null || PATH=$(printf '%s' "${PATH#*/opt/locki/bin/high:}" | tr ':' '\n' | grep -v '/mise/shims' | paste -sd:) command -v "$1" || exit 1
+mise which "$1" 2>/dev/null || PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/opt/locki/bin/' | paste -sd:) command -v "$1" || exit 1
 EOF
 
 ## locki-node-modules-redirect: point the project's node_modules at the btrfs cache
@@ -125,7 +108,7 @@ EOF
 cat > /opt/locki/bin/high/locki-node-modules-redirect << 'EOF'
 #!/bin/sh
 [ -n "${LOCKI_SCOPED_CACHE:-}" ] || exit 0
-_dir="$("$(locki-command-real-or-autoinstalled npm)" prefix 2>/dev/null)" || exit 0
+_dir="$("$(locki-command-real npm)" prefix 2>/dev/null)" || exit 0
 [ -f "$_dir/package.json" ] || exit 0
 _target="$LOCKI_SCOPED_CACHE/node-modules${_dir}/node_modules"
 if [ -L "$_dir/node_modules" ] || [ ! -e "$_dir/node_modules" ]; then
@@ -167,7 +150,7 @@ esac
 if [ "$cmd" = git ] && ! locki-command-real git >/dev/null 2>&1; then
   /opt/locki/bin/high/locki-auto-install git sh -c 'if command -v dnf >/dev/null 2>&1; then dnf install -yq git; elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -yqq git; elif command -v apk >/dev/null 2>&1; then apk add --no-cache git; fi'
 fi
-exec "$(locki-command-real-or-autoinstalled "$cmd")" "$@"
+exec "$(locki-command-real "$cmd")" "$@"
 EOF
 
 ## agent-browser: install chromium if missing, set env, then exec real binary
@@ -178,7 +161,7 @@ if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/
   /opt/locki/bin/high/locki-auto-install chromium sh -c 'if command -v dnf >/dev/null 2>&1; then dnf install -yq chromium; elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -yqq chromium-browser; fi'
 fi
 export AGENT_BROWSER_EXECUTABLE_PATH=$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null)
-exec "$(locki-command-real-or-autoinstalled agent-browser)" "$@"
+exec "$(locki-command-real agent-browser)" "$@"
 EOF
 
 ## npm: symlink node_modules to btrfs
@@ -186,14 +169,14 @@ cat > /opt/locki/bin/high/npm << 'EOF'
 #!/bin/bash
 set -eo pipefail
 locki-node-modules-redirect
-exec "$(locki-command-real-or-autoinstalled npm)" "$@"
+exec "$(locki-command-real npm)" "$@"
 EOF
 
 ## pnpm: cache + global virtual store
 cat > /opt/locki/bin/high/pnpm << 'EOF'
 #!/bin/bash
 set -eo pipefail
-_real=$(locki-command-real-or-autoinstalled pnpm) || exit 1
+_real=$(locki-command-real pnpm) || exit 1
 if ! "$_real" config get enable-global-virtual-store 2>/dev/null | grep -q true; then
   /opt/locki/bin/high/locki-auto-install pnpm sh -c "\"$_real\" config set store-dir /var/cache/locki/pnpm && \"$_real\" config set global-bin-dir /usr/local/bin && \"$_real\" config set enable-global-virtual-store true && \"$_real\" config delete virtual-store-dir 2>/dev/null || true"
 fi
@@ -204,7 +187,7 @@ EOF
 cat > /opt/locki/bin/high/uv << 'EOF'
 #!/bin/bash
 set -eo pipefail
-_real=$(locki-command-real-or-autoinstalled uv) || exit 1
+_real=$(locki-command-real uv) || exit 1
 if [ -n "${LOCKI_SCOPED_CACHE:-}" ] && _dir="$("$_real" workspace dir 2>/dev/null)"; then
   if [ -L "$_dir/.venv" ] || [ ! -e "$_dir/.venv" ]; then
     export UV_PROJECT_ENVIRONMENT="$LOCKI_SCOPED_CACHE/uv-venvs${_dir}/.venv"
@@ -219,7 +202,7 @@ cat > /opt/locki/bin/high/yarn << 'EOF'
 #!/bin/bash
 set -eo pipefail
 locki-node-modules-redirect
-exec "$(locki-command-real-or-autoinstalled yarn)" "$@"
+exec "$(locki-command-real yarn)" "$@"
 EOF
 
 ## bun: symlink node_modules to btrfs + redirect cache (BUN_INSTALL_CACHE_DIR)
@@ -227,7 +210,7 @@ cat > /opt/locki/bin/high/bun << 'EOF'
 #!/bin/bash
 set -eo pipefail
 locki-node-modules-redirect
-exec "$(locki-command-real-or-autoinstalled bun)" "$@"
+exec "$(locki-command-real bun)" "$@"
 EOF
 
 ## Docker: auto-install + route builds through the shared BuildKit daemon.
@@ -329,81 +312,19 @@ chmod +x /opt/locki/bin/high/*
 
 mkdir -p /opt/locki/bin/low
 
-## NPM packages
-for pair in \
-  "@mariozechner/pi-coding-agent=pi" \
-  "@openai/codex=codex" \
-  "agent-browser=agent-browser" \
-  "corepack=corepack" \
-; do
-  pkg="${pair%%=*}"
-  bin="${pair#*=}"
-  cat > "/opt/locki/bin/low/$bin" << EOF
-#!/bin/bash
-set -eo pipefail
-if ! locki-command-real $bin >/dev/null 2>&1; then
-  /opt/locki/bin/high/locki-auto-install $pkg /opt/locki/bin/high/locki-mise-install npm:$pkg
-fi
-exec "\$(locki-command-real $bin)" "\$@"
+## pnpm, pnpx, yarn and yarnpkg come with corepack (sandbox tools); pnpm's newer short
+## alias for pnpx does not
+cat > /opt/locki/bin/low/pnx << 'EOF'
+#!/bin/sh
+exec pnpx "$@"
 EOF
-done
-
-## Corepack packages
-for pair in \
-  "pnpm=pnpm" \
-  "pnpm=pnpx" \
-  "pnpm=pnx" \
-  "yarn=yarn" \
-; do
-  pkg="${pair%%=*}"
-  bin="${pair#*=}"
-  cat > "/opt/locki/bin/low/$bin" << EOF
-#!/bin/bash
-set -eo pipefail
-if ! locki-command-real $bin >/dev/null 2>&1; then
-  /opt/locki/bin/high/locki-auto-install $pkg corepack enable $pkg
-fi
-exec "\$(locki-command-real $bin)" "\$@"
-EOF
-done
-
-## Mise packages
-for pair in \
-  "bun=bun" \
-  "claude=claude" \
-  "fd=fd" \
-  "github:anomalyco/opencode=opencode" \
-  "github:google-antigravity/antigravity-cli=antigravity" \
-  "github:github/copilot-cli=copilot" \
-  "github:keilerkonzept/dockerfile-json=dockerfile-json" \
-  "jq=jq" \
-  "k9s=k9s" \
-  "kubectl=kubectl" \
-  "pipx:poetry=poetry" \
-  "python=pip" \
-  "python=pip3" \
-  "python=python" \
-  "python=python3" \
-  "rg=rg" \
-  "uv=uv" \
-  "uv=uvx" \
-  "yq=yq" \
-; do
-  pkg="${pair%%=*}"
-  bin="${pair#*=}"
-  cat > "/opt/locki/bin/low/$bin" << EOF
-#!/bin/bash
-set -eo pipefail
-if ! locki-command-real $bin >/dev/null 2>&1; then
-  /opt/locki/bin/high/locki-auto-install $pkg /opt/locki/bin/high/locki-mise-install $pkg
-fi
-exec "\$(locki-command-real $bin)" "\$@"
-EOF
-done
 
 ## The release tarball's only binary is `antigravity`; `agy` (the name upstream's own
 ## installer uses, and what users type) is a symlink shipped in the macOS archive only.
-ln -sf antigravity /opt/locki/bin/low/agy
+cat > /opt/locki/bin/low/agy << 'EOF'
+#!/bin/sh
+exec antigravity "$@"
+EOF
 
 cat > /opt/locki/bin/low/bwrap << 'EOF'
 #!/bin/sh
@@ -464,28 +385,3 @@ if /opt/locki/bin/high/locki-fetch "$ca_url" "$ca_tmp"; then
   fi
 fi
 rm -f "$ca_tmp"
-
-# MARK: Mise + Node.js
-## Always installed: every shim installs through mise, the AI CLIs are npm packages, and mise
-## itself resolves npm-backed tools by shelling out to npm. Last, since it needs the network.
-
-/opt/locki/bin/high/locki-auto-install mise sh -c '
-  set -eu
-  version="2026.7.15"
-  case "$(uname -m)" in
-    x86_64)  arch="x64";   checksum="0785821a617e85197104c021835072ca3f4fcdda143538293a30593acc258969";;
-    aarch64) arch="arm64"; checksum="0c2ca4d4ee79720a08d2c5f54c986450348b0fe25ace2bf9998dbe6c6761bf16";;
-  esac
-  dest="/var/cache/locki/mise-install/mise-v$version-linux-$arch"
-  if ! test -x "$dest/mise/bin/mise"; then
-    mkdir -p /var/cache/locki/mise-install
-    unpack=$(mktemp -d /var/cache/locki/mise-install/.unpack-XXXXXX)
-    trap "rm -rf $unpack" EXIT
-    /opt/locki/bin/high/locki-fetch "https://mise.jdx.dev/v$version/mise-v$version-linux-$arch.tar.gz" "$unpack/mise.tar.gz"
-    [ "$(sha256sum "$unpack/mise.tar.gz" | cut -d" " -f1)" = "$checksum" ] || { echo "mise checksum mismatch" >&2; exit 1; }
-    tar -xzf "$unpack/mise.tar.gz" -C "$unpack" && rm "$unpack/mise.tar.gz"
-    rm -rf "$dest" && mv "$unpack" "$dest"
-  fi
-  ln -sf "$dest/mise/bin/mise" /usr/local/bin/mise
-'
-/opt/locki/bin/high/locki-auto-install nodejs /opt/locki/bin/high/locki-mise-install node
