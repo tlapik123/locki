@@ -131,7 +131,7 @@ You can open, inspect and interact with websites using agent-browser. When in ne
 
 ## Other
 
-Preinstalled: `bun`, `docker`, `fd`, `jq`, `k9s`, `kubectl`, `mise`, `node`/`npm`/`npx`, `pnpm`/`pnpx`, `poetry`, `rg`, `uv`/`uvx`, `yarn`, `yq`.
+Preinstalled: `bun`, `docker`, `fd`, `java`, `jq`, `k9s`, `kubectl`, `mise`, `node`/`npm`/`npx`, `pnpm`/`pnpx`, `poetry`, `rg`, `uv`/`uvx`, `yarn`, `yq`.
 
 ## Docker builds
 

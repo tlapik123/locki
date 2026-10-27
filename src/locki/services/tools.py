@@ -49,7 +49,7 @@ HARNESSES = [
     "npm:@openai/codex",
 ]
 
-# mise tool specs, all tracking their newest release
+# mise tool specs, all tracking their newest release unless pinned in PINS
 TOOLS = [
     *HARNESSES,
     "node",
@@ -58,6 +58,7 @@ TOOLS = [
     "bun",
     "fd",
     "github:keilerkonzept/dockerfile-json",
+    "java",
     "jq",
     "k9s",
     "kubectl",
@@ -68,6 +69,9 @@ TOOLS = [
     "yq",
 ]
 
+# version prefix instead of `latest`: JDK 21 is what Ghidra 12.1 (REA) is verified with
+PINS = {"java": "temurin-21"}
+
 _SYNC_STATE = STATE / "tools-sync.json"
 
 # Pinned resolutions (URL + checksum) for tools the GitHub API keeps from installing, see
@@ -77,7 +81,7 @@ _FALLBACK_LOCK = PACKAGE_DATA / "tools.lock"
 
 def _mise_toml() -> str:
     return f"[settings]\nminimum_release_age_excludes = {json.dumps(HARNESSES)}\n\n[tools]\n" + "".join(
-        f'{json.dumps(spec)} = "latest"\n' for spec in TOOLS
+        f"{json.dumps(spec)} = {json.dumps(PINS.get(spec, 'latest'))}\n" for spec in TOOLS
     )
 
 
@@ -95,11 +99,11 @@ def github_token() -> str:
 class ToolsService:
     def _fingerprint(self) -> str:
         """Changes whenever the VM needs a sync regardless of the upgrade interval: a new tool
-        list or sync script (e.g. a Locki upgrade), or a recreated VM."""
+        list, pin or sync script (e.g. a Locki upgrade), or a recreated VM."""
         lima_yaml = LIMA / "locki" / "lima.yaml"
         vm_id = str(lima_yaml.stat().st_mtime_ns) if lima_yaml.exists() else ""
         script = (PACKAGE_DATA / "tools-sync.sh").read_bytes() + _FALLBACK_LOCK.read_bytes()
-        return hashlib.sha256(json.dumps([VERSION, vm_id, TOOLS]).encode() + script).hexdigest()
+        return hashlib.sha256(json.dumps([VERSION, vm_id, TOOLS, PINS]).encode() + script).hexdigest()
 
     def _state(self) -> dict:
         try:
